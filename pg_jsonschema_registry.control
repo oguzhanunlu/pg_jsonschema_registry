@@ -1,0 +1,2 @@
+comment = 'JSON Schema Registry for PostgreSQL'
+default_version = '0.1.0'
