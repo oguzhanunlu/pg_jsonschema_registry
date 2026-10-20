@@ -249,6 +249,21 @@ Compiled from each project's README as of 2026-10; check them for current detail
 
 See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the local setup, tests and lint commands.
 
+## Project status
+
+v0.1 is complete and verified on the `feat/registry-v0.1` branch but not yet
+released. The companion documents:
+
+- [`docs/PROCESS.md`](docs/PROCESS.md): the research, every decision and
+  ruling, the per-task progress log, and what was parked.
+- [`docs/ROADMAP.md`](docs/ROADMAP.md): what to do before merging, v0.2
+  candidates, release notes, and an upstream issue draft.
+- [`docs/superpowers/specs/`](docs/superpowers/specs/) and
+  [`docs/superpowers/plans/`](docs/superpowers/plans/): the design document
+  and the task-by-task implementation plan it was built from.
+- [`docs/benchmarks.md`](docs/benchmarks.md): the measured comparison with
+  pg_jsonschema, with raw numbers and caveats.
+
 ## License
 
 [PostgreSQL License](./LICENSE)
