@@ -149,6 +149,8 @@ Errors and SQLSTATEs:
 | `unregister`: version is referenced by other schemas | `2BP01` | `schema <name> version <v> is referenced by <name>/<v>, ...` |
 | `valid`, `errors`, `validate`, `get`, `unregister`: unknown name/version | `42704` | `schema <name> version <v> is not registered` |
 | `latest_version` and the no-version overloads: name has no versions | `42704` | `schema <name> has no registered versions` |
+| `valid`, `errors`, `validate`: document nested deeper than 4096 levels | `54001` | `document nesting exceeds 4096 levels` |
+| `register`: schema nested deeper than 100 levels | `54001` | `schema nesting exceeds 100 levels` |
 | `validate`: document does not match | `23514` | `document does not match schema <name> version <v>: <first error> at <instance path>` |
 
 For `validate`, the DETAIL line is `<n> error(s): [...]` with every error as a JSON array. For a large document with many errors it can be large.
@@ -237,6 +239,7 @@ Compiled from each project's README as of 2026-10; check them for current detail
 - The overloads without a version (`valid(doc, name)`, `errors(doc, name)`, `validate(doc, name)`) look up the latest version in the table on every call. They are not meant for constraints; use them for ad hoc queries.
 - `register` and `unregister` are not parallel safe, by design. The validation functions are.
 - `validate` puts every error in the DETAIL line, which can be large for big documents with many violations.
+- Documents nested deeper than 4096 levels are refused by `valid`, `errors` and `validate` with SQLSTATE `54001` (`document nesting exceeds 4096 levels`), and schemas nested deeper than 100 levels are refused by `register` (`54001`, `schema nesting exceeds 100 levels`). The validator recurses per nesting level without a limit of its own, so the document cap keeps a deeply nested document (which PostgreSQL can build, for example with `jsonb_build_array` in a loop) from overflowing the backend's stack. The cap counts document levels, not stack frames: a schema that recurses through several keywords per level (`allOf` inside `anyOf` inside `$ref`, and so on) uses more stack per level.
 - The cache is per backend and rebuilt on first use, so the first call in each new connection pays the compile cost (about 33 ms for the FHIR R4 schema in the benchmark's spot check).
 
 ## Development

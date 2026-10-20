@@ -5,6 +5,7 @@ use pgrx::prelude::*;
 mod api;
 mod cache;
 mod compile;
+mod depth;
 mod errors;
 mod raw;
 mod registry;

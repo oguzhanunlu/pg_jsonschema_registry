@@ -15,6 +15,21 @@ impl RawJsonb {
         // SAFETY: self.0 is a non-null, detoasted varlena that lives for the call.
         unsafe { pgrx::varlena_to_byte_slice(self.0) }
     }
+
+    /// The document as a `serde_json::Value` (through `jsonb_out`, as `pgrx::JsonB` does;
+    /// `serde_json` refuses more than 127 levels of nesting, which panics into an ERROR).
+    pub fn to_value(&self) -> serde_json::Value {
+        // SAFETY: self.0 is a non-null jsonb varlena that lives for the call.
+        unsafe {
+            pgrx::JsonB::from_polymorphic_datum(
+                pg_sys::Datum::from(self.0),
+                false,
+                pg_sys::JSONBOID,
+            )
+        }
+        .expect("jsonb argument is not null")
+        .0
+    }
 }
 
 impl FromDatum for RawJsonb {

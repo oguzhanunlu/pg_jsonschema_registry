@@ -16,9 +16,20 @@ pub(crate) fn fail_with_detail(code: PgSqlErrorCode, msg: String, detail: String
     unreachable!("ERROR does not return")
 }
 
+/// Raises `54001` if `doc` nests deeper than [`crate::depth::MAX_DEPTH`].
+fn check_depth(doc: &crate::raw::RawJsonb) {
+    use crate::depth::{exceeds_depth, MAX_DEPTH};
+    if exceeds_depth(doc.as_bytes(), MAX_DEPTH) {
+        fail(
+            PgSqlErrorCode::ERRCODE_STATEMENT_TOO_COMPLEX,
+            format!("document nesting exceeds {MAX_DEPTH} levels"),
+        );
+    }
+}
+
 #[pg_schema]
 mod jsonschema {
-    use super::{fail, fail_with_detail};
+    use super::{check_depth, fail, fail_with_detail};
     use crate::raw::RawJsonb;
     use crate::{cache, compile, registry};
     use jsonschema::json::Jsonb;
@@ -26,28 +37,31 @@ mod jsonschema {
     use pgrx::JsonB;
 
     #[pg_extern(volatile, strict, parallel_unsafe, name = "register")]
-    fn register_next(name: &str, schema: JsonB) -> i32 {
-        do_register(name, None, schema.0)
+    fn register_next(name: &str, schema: RawJsonb) -> i32 {
+        do_register(name, None, schema)
     }
 
     #[pg_extern(volatile, strict, parallel_unsafe, name = "register")]
-    fn register_version(name: &str, version: i32, schema: JsonB) -> i32 {
-        do_register(name, Some(version), schema.0)
+    fn register_version(name: &str, version: i32, schema: RawJsonb) -> i32 {
+        do_register(name, Some(version), schema)
     }
 
     #[pg_extern(stable, strict, parallel_safe)]
     fn valid(doc: RawJsonb, name: &str, version: i32) -> bool {
+        check_depth(&doc);
         cache::get_or_compile(name, version).is_valid(Jsonb::root(doc.as_bytes()))
     }
 
     #[pg_extern(stable, strict, parallel_safe)]
     fn errors(doc: RawJsonb, name: &str, version: i32) -> JsonB {
+        check_depth(&doc);
         let v = cache::get_or_compile(name, version);
         JsonB(serde_json::Value::Array(crate::errors::collect(&v, &doc)))
     }
 
     #[pg_extern(stable, strict, parallel_safe)]
     fn validate(doc: RawJsonb, name: &str, version: i32) -> bool {
+        check_depth(&doc);
         let v = cache::get_or_compile(name, version);
         if v.is_valid(Jsonb::root(doc.as_bytes())) {
             return true;
@@ -196,11 +210,20 @@ CREATE TRIGGER refs_changed AFTER INSERT OR DELETE ON jsonschema.refs
         cache::invalidate();
     }
 
-    fn do_register(name: &str, version: Option<i32>, schema: serde_json::Value) -> i32 {
+    fn do_register(name: &str, version: Option<i32>, raw: RawJsonb) -> i32 {
+        use crate::depth::{exceeds_depth, SCHEMA_MAX_DEPTH};
         const BAD: PgSqlErrorCode = PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE;
         if name.is_empty() {
             fail(BAD, "name must not be empty".into());
         }
+        // Checked on the jsonb bytes, before serde_json (which stops at 127 levels) runs.
+        if exceeds_depth(raw.as_bytes(), SCHEMA_MAX_DEPTH) {
+            fail(
+                PgSqlErrorCode::ERRCODE_STATEMENT_TOO_COMPLEX,
+                format!("schema nesting exceeds {SCHEMA_MAX_DEPTH} levels"),
+            );
+        }
+        let schema = raw.to_value();
         registry::lock_for_register();
         let max = registry::max_version(name);
         let version = match version {
@@ -739,6 +762,94 @@ mod tests {
         .catch_when(PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE, |_| true)
         .execute();
         assert!(denied);
+    }
+
+    /// Runs `sql` expecting an ERROR and returns its SQLSTATE and message.
+    fn error_code(sql: &str) -> (PgSqlErrorCode, String) {
+        PgTryBuilder::new(|| {
+            reg(sql).unwrap();
+            panic!("expected an error from: {sql}");
+        })
+        .catch_others(|e| match e {
+            CaughtError::PostgresError(r)
+            | CaughtError::ErrorReport(r)
+            | CaughtError::RustPanic { ereport: r, .. } => {
+                (r.sql_error_code(), r.message().to_string())
+            }
+        })
+        .execute()
+    }
+
+    #[pg_test]
+    fn deeply_nested_document_is_refused() {
+        reg("SELECT jsonschema.register('rec', '{\"type\":\"array\",\"items\":{\"$ref\":\"#\"}}')")
+            .unwrap();
+        let (code, msg) = error_code(
+            "SELECT jsonschema.valid((repeat('[', 5000) || repeat(']', 5000))::jsonb, 'rec', 1)::int",
+        );
+        assert_eq!(code, PgSqlErrorCode::ERRCODE_STATEMENT_TOO_COMPLEX);
+        assert_eq!(msg, "document nesting exceeds 4096 levels");
+    }
+
+    #[pg_test(error = "document nesting exceeds 4096 levels")]
+    fn deeply_nested_document_is_refused_by_errors() {
+        reg("SELECT jsonschema.register('rec', '{}')").unwrap();
+        Spi::run(
+            "SELECT jsonschema.errors((repeat('[', 4097) || repeat(']', 4097))::jsonb, 'rec', 1)",
+        )
+        .unwrap();
+    }
+
+    #[pg_test(error = "document nesting exceeds 4096 levels")]
+    fn deeply_nested_document_is_refused_by_validate() {
+        reg("SELECT jsonschema.register('rec', '{}')").unwrap();
+        Spi::run(
+            "SELECT jsonschema.validate((repeat('[', 4097) || repeat(']', 4097))::jsonb, 'rec', 1)",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn document_at_4000_levels_validates_against_recursive_schema() {
+        reg("SELECT jsonschema.register('rec', '{\"type\":\"array\",\"items\":{\"$ref\":\"#\"}}')")
+            .unwrap();
+        let doc = "(repeat('[', 4000) || repeat(']', 4000))::jsonb";
+        assert_eq!(
+            Spi::get_one::<bool>(&format!("SELECT jsonschema.valid({doc}, 'rec', 1)")),
+            Ok(Some(true))
+        );
+        let bad = "(repeat('[', 3999) || '1' || repeat(']', 3999))::jsonb";
+        assert_eq!(
+            Spi::get_one::<bool>(&format!("SELECT jsonschema.valid({bad}, 'rec', 1)")),
+            Ok(Some(false))
+        );
+        let errs =
+            Spi::get_one::<pgrx::JsonB>(&format!("SELECT jsonschema.errors({bad}, 'rec', 1)"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(errs.0.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            Spi::get_one::<bool>(&format!("SELECT jsonschema.validate({doc}, 'rec', 1)")),
+            Ok(Some(true))
+        );
+    }
+
+    #[pg_test]
+    fn deeply_nested_schema_is_refused() {
+        let (code, msg) = error_code(
+            "SELECT jsonschema.register('deep', ('{\"not\":' || repeat('[', 100) || repeat(']', 100) || '}')::jsonb)",
+        );
+        assert_eq!(code, PgSqlErrorCode::ERRCODE_STATEMENT_TOO_COMPLEX);
+        assert_eq!(msg, "schema nesting exceeds 100 levels");
+    }
+
+    #[pg_test]
+    fn schema_at_100_levels_is_accepted() {
+        let nested = format!("{}{{}}{}", "{\"not\":".repeat(99), "}".repeat(99));
+        assert_eq!(
+            reg(&format!("SELECT jsonschema.register('deep', '{nested}')")),
+            Ok(Some(1))
+        );
     }
 
     #[pg_test]
