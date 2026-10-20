@@ -42,20 +42,28 @@ SELECT i AS id,
        ) AS doc
 FROM generate_series(1, 10000) AS i;
 
+-- Same rows, 10x fewer, for a second data point per scenario: two row counts
+-- with an identical scan shape separate per-statement fixed cost from
+-- per-row marginal cost.
+CREATE TABLE docs_small_10k AS SELECT * FROM docs_small WHERE id <= 10000;
+CREATE TABLE docs_fhir_1k   AS SELECT * FROM docs_fhir  WHERE id <= 1000;
+
 -- CHECK-constraint targets. A CHECK cannot contain a subquery, so theirs
 -- embeds the schema as a jsonschema constant (same schema text as theirs_small).
 CREATE TABLE ins_plain (payload jsonb);
 CREATE TABLE ins_ours  (payload jsonb CHECK (jsonschema.valid(payload, 'small', 1)));
 CREATE TABLE ins_theirs(payload jsonb CHECK (jsonb_matches_compiled_schema(:'small_schema'::json::jsonschema, payload)));
 
-VACUUM ANALYZE docs_small, docs_fhir, theirs_small, theirs_fhir;
+VACUUM ANALYZE docs_small, docs_fhir, docs_small_10k, docs_fhir_1k, theirs_small, theirs_fhir;
 
 -- Sanity: both extensions must accept every generated document and reject a
 -- broken one, otherwise the benchmark measures nothing.
 DO $$
 DECLARE
   bad_small jsonb := '{"id":"x","name":1}';
-  bad_fhir  jsonb := '{"resourceType":"Patient","id":"pat-x","gender":"robot"}';
+  -- a fixture-shaped Patient whose only defect is an invalid gender enum value
+  good_fhir jsonb := '{"resourceType":"Patient","id":"pat-x","active":true,"name":[{"use":"official","family":"F","given":["G"]}],"gender":"female","birthDate":"1980-01-01"}';
+  bad_fhir  jsonb := '{"resourceType":"Patient","id":"pat-x","active":true,"name":[{"use":"official","family":"F","given":["G"]}],"gender":"robot","birthDate":"1980-01-01"}';
 BEGIN
   IF (SELECT count(*) FROM docs_small WHERE jsonschema.valid(doc, 'small', 1)) <> 100000 THEN
     RAISE EXCEPTION 'ours rejects some small docs'; END IF;
@@ -67,6 +75,8 @@ BEGIN
     RAISE EXCEPTION 'theirs rejects some FHIR docs'; END IF;
   IF jsonschema.valid(bad_small, 'small', 1) OR jsonb_matches_compiled_schema((SELECT s FROM theirs_small), bad_small) THEN
     RAISE EXCEPTION 'a broken small doc was accepted'; END IF;
+  IF NOT jsonschema.valid(good_fhir, 'fhir', 1) OR NOT jsonb_matches_compiled_schema((SELECT s FROM theirs_fhir), good_fhir) THEN
+    RAISE EXCEPTION 'the control Patient was rejected'; END IF;
   IF jsonschema.valid(bad_fhir, 'fhir', 1) OR jsonb_matches_compiled_schema((SELECT s FROM theirs_fhir), bad_fhir) THEN
     RAISE EXCEPTION 'a broken FHIR doc was accepted'; END IF;
   RAISE NOTICE 'sanity checks passed: both extensions accept all fixtures and reject broken docs';

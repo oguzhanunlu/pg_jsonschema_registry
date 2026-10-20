@@ -10,9 +10,12 @@
 
 ARG PG_MAJOR=18
 ARG PG_JSONSCHEMA_COMMIT=472830ca7b6ab5d2c9d74d68ee9fc2c07529e60e
+# Base images pinned by the digests the published results were measured with.
+ARG RUST_IMAGE=rust:1-trixie@sha256:e259494b14672950a909b4c54527e19d29cae6ebf980672114c8bb85e5594e4a
+ARG PG_IMAGE=postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
 
 ############################################################################
-FROM rust:1-trixie AS base
+FROM ${RUST_IMAGE} AS base
 ARG PG_MAJOR
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg unzip \
@@ -60,7 +63,7 @@ WORKDIR /src
 RUN cargo pgrx package --pg-config ${PG_CONFIG} --no-default-features --features pg${PG_MAJOR}
 
 ############################################################################
-FROM postgres:18
+FROM ${PG_IMAGE}
 COPY --from=theirs /build/target/release/pg_jsonschema-pg18/usr/ /usr/
 COPY --from=ours   /src/target/release/pg_jsonschema_registry-pg18/usr/ /usr/
 COPY --from=fhir   /bench/fhir.schema.json /bench/fhir.schema.json
