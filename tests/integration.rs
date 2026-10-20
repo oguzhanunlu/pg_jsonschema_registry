@@ -45,7 +45,8 @@ fn cleanup(c: &mut Client, names: &[&str]) {
 /// registry does `AcceptInvalidationMessages`), so the next transaction starts
 /// with nothing pending and its first miss fills the cache.
 fn absorb(c: &mut Client) {
-    c.batch_execute("SELECT count(*) FROM jsonschema.registry").unwrap();
+    c.batch_execute("SELECT count(*) FROM jsonschema.registry")
+        .unwrap();
 }
 
 fn sqlstate(e: &postgres::Error) -> Option<&SqlState> {
@@ -58,12 +59,24 @@ fn other_backend_sees_reregistered_schema() {
     let mut a = client();
     let mut b = client();
     cleanup(&mut a, &["p"]);
-    a.execute("SELECT jsonschema.register('p', 1, '{\"type\":\"object\"}')", &[]).unwrap();
+    a.execute(
+        "SELECT jsonschema.register('p', 1, '{\"type\":\"object\"}')",
+        &[],
+    )
+    .unwrap();
     absorb(&mut b);
     assert!(!valid(&mut b, "[]")); // b's cache now holds the object schema
-    a.execute("SELECT jsonschema.unregister('p', 1)", &[]).unwrap();
-    a.execute("SELECT jsonschema.register('p', 1, '{\"type\":\"array\"}')", &[]).unwrap();
-    assert!(valid(&mut b, "[]"), "b must not answer from its stale cached validator");
+    a.execute("SELECT jsonschema.unregister('p', 1)", &[])
+        .unwrap();
+    a.execute(
+        "SELECT jsonschema.register('p', 1, '{\"type\":\"array\"}')",
+        &[],
+    )
+    .unwrap();
+    assert!(
+        valid(&mut b, "[]"),
+        "b must not answer from its stale cached validator"
+    );
 }
 
 #[test]
@@ -75,16 +88,29 @@ fn rolled_back_register_leaves_no_phantom() {
     absorb(&mut a);
     let mut tx = a.transaction().unwrap();
     // a's own change: visible to its snapshot, so the next call fills the cache.
-    tx.execute("SELECT jsonschema.register('ph', 1, '{\"type\":\"array\"}')", &[]).unwrap();
-    assert!(tx.query_one("SELECT jsonschema.valid('[]', 'ph', 1)", &[]).unwrap().get::<_, bool>(0));
+    tx.execute(
+        "SELECT jsonschema.register('ph', 1, '{\"type\":\"array\"}')",
+        &[],
+    )
+    .unwrap();
+    assert!(tx
+        .query_one("SELECT jsonschema.valid('[]', 'ph', 1)", &[])
+        .unwrap()
+        .get::<_, bool>(0));
     tx.rollback().unwrap();
     let err = a
         .query_one("SELECT jsonschema.valid('[]', 'ph', 1)", &[])
         .expect_err("rolled-back schema must not be served from the cache");
     assert_eq!(sqlstate(&err), Some(&SqlState::UNDEFINED_OBJECT), "{err:?}");
-    b.execute("SELECT jsonschema.register('ph', 1, '{\"type\":\"object\"}')", &[]).unwrap();
+    b.execute(
+        "SELECT jsonschema.register('ph', 1, '{\"type\":\"object\"}')",
+        &[],
+    )
+    .unwrap();
     assert!(
-        !a.query_one("SELECT jsonschema.valid('[]', 'ph', 1)", &[]).unwrap().get::<_, bool>(0),
+        !a.query_one("SELECT jsonschema.valid('[]', 'ph', 1)", &[])
+            .unwrap()
+            .get::<_, bool>(0),
         "a must apply b's object schema, not the rolled-back array schema"
     );
 }
@@ -95,21 +121,46 @@ fn repeatable_read_sees_its_snapshot_then_the_new_schema() {
     let mut a = client();
     let mut b = client();
     cleanup(&mut a, &["rr"]);
-    a.execute("SELECT jsonschema.register('rr', 1, '{\"type\":\"object\"}')", &[]).unwrap();
+    a.execute(
+        "SELECT jsonschema.register('rr', 1, '{\"type\":\"object\"}')",
+        &[],
+    )
+    .unwrap();
     let mut tx = a.transaction().unwrap(); // BEGIN
-    // Simple-protocol statements: SET TRANSACTION must be the first statement, and
-    // the first query takes the snapshot.
-    tx.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").unwrap();
+                                           // Simple-protocol statements: SET TRANSACTION must be the first statement, and
+                                           // the first query takes the snapshot.
+    tx.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
     tx.batch_execute("SELECT 1").unwrap(); // snapshot taken
-    let iso: String = tx.query_one("SHOW transaction_isolation", &[]).unwrap().get(0);
+    let iso: String = tx
+        .query_one("SHOW transaction_isolation", &[])
+        .unwrap()
+        .get(0);
     assert_eq!(iso, "repeatable read");
-    b.execute("SELECT jsonschema.unregister('rr', 1)", &[]).unwrap();
-    b.execute("SELECT jsonschema.register('rr', 1, '{\"type\":\"array\"}')", &[]).unwrap();
-    let old: bool = tx.query_one("SELECT jsonschema.valid('[]', 'rr', 1)", &[]).unwrap().get(0);
-    assert!(!old, "inside the RR transaction the OLD schema (object) must apply");
+    b.execute("SELECT jsonschema.unregister('rr', 1)", &[])
+        .unwrap();
+    b.execute(
+        "SELECT jsonschema.register('rr', 1, '{\"type\":\"array\"}')",
+        &[],
+    )
+    .unwrap();
+    let old: bool = tx
+        .query_one("SELECT jsonschema.valid('[]', 'rr', 1)", &[])
+        .unwrap()
+        .get(0);
+    assert!(
+        !old,
+        "inside the RR transaction the OLD schema (object) must apply"
+    );
     tx.commit().unwrap();
-    let new: bool = a.query_one("SELECT jsonschema.valid('[]', 'rr', 1)", &[]).unwrap().get(0);
-    assert!(new, "after the RR transaction the NEW schema (array) must apply, not a cached stale one");
+    let new: bool = a
+        .query_one("SELECT jsonschema.valid('[]', 'rr', 1)", &[])
+        .unwrap()
+        .get(0);
+    assert!(
+        new,
+        "after the RR transaction the NEW schema (array) must apply, not a cached stale one"
+    );
 }
 
 #[test]
@@ -118,16 +169,34 @@ fn open_read_committed_transaction_sees_committed_change_on_hit_path() {
     let mut a = client();
     let mut b = client();
     cleanup(&mut a, &["rc"]);
-    a.execute("SELECT jsonschema.register('rc', 1, '{\"type\":\"object\"}')", &[]).unwrap();
+    a.execute(
+        "SELECT jsonschema.register('rc', 1, '{\"type\":\"object\"}')",
+        &[],
+    )
+    .unwrap();
     absorb(&mut a);
     let mut tx = a.transaction().unwrap();
     // Miss with nothing pending: compiles and caches; the next call is a hit.
-    let warm: bool = tx.query_one("SELECT jsonschema.valid('[]', 'rc', 1)", &[]).unwrap().get(0);
+    let warm: bool = tx
+        .query_one("SELECT jsonschema.valid('[]', 'rc', 1)", &[])
+        .unwrap()
+        .get(0);
     assert!(!warm);
-    b.execute("SELECT jsonschema.unregister('rc', 1)", &[]).unwrap();
-    b.execute("SELECT jsonschema.register('rc', 1, '{\"type\":\"array\"}')", &[]).unwrap();
-    let after: bool = tx.query_one("SELECT jsonschema.valid('[]', 'rc', 1)", &[]).unwrap().get(0);
-    assert!(after, "a hit inside an open READ COMMITTED transaction must observe B's committed change");
+    b.execute("SELECT jsonschema.unregister('rc', 1)", &[])
+        .unwrap();
+    b.execute(
+        "SELECT jsonschema.register('rc', 1, '{\"type\":\"array\"}')",
+        &[],
+    )
+    .unwrap();
+    let after: bool = tx
+        .query_one("SELECT jsonschema.valid('[]', 'rc', 1)", &[])
+        .unwrap()
+        .get(0);
+    assert!(
+        after,
+        "a hit inside an open READ COMMITTED transaction must observe B's committed change"
+    );
     tx.commit().unwrap();
 }
 
@@ -145,7 +214,10 @@ fn valid_runs_in_parallel_workers() {
     )
     .unwrap();
     let plan = c
-        .query("EXPLAIN SELECT count(*) FROM many WHERE jsonschema.valid(d, 'par', 1)", &[])
+        .query(
+            "EXPLAIN SELECT count(*) FROM many WHERE jsonschema.valid(d, 'par', 1)",
+            &[],
+        )
         .unwrap()
         .iter()
         .map(|r| r.get::<_, String>(0))
@@ -167,7 +239,10 @@ fn valid_runs_in_parallel_workers() {
         .unwrap_or(0);
     assert!(launched > 0, "no parallel worker ran valid():\n{analyzed}");
     let n: i64 = c
-        .query_one("SELECT count(*) FROM many WHERE jsonschema.valid(d, 'par', 1)", &[])
+        .query_one(
+            "SELECT count(*) FROM many WHERE jsonschema.valid(d, 'par', 1)",
+            &[],
+        )
         .unwrap()
         .get(0);
     assert_eq!(n, 50000);

@@ -40,8 +40,11 @@ use std::collections::HashMap;
 use std::ptr;
 use std::sync::Arc;
 
+/// Compiled validators by `(name, version)`.
+type ValidatorMap = HashMap<(String, i32), Arc<Validator<Jsonb>>>;
+
 thread_local! {
-    static CACHE: RefCell<HashMap<(String, i32), Arc<Validator<Jsonb>>>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<ValidatorMap> = RefCell::new(HashMap::new());
     static COMPILES: Cell<u64> = const { Cell::new(0) };
     /// Bumped by every relevant invalidation; a compile that straddles one is not cached.
     static GENERATION: Cell<u64> = const { Cell::new(0) };
@@ -104,6 +107,7 @@ pub fn clear() {
 }
 
 /// Number of compiles done by [`get_or_compile`] in this backend (test observability).
+#[cfg(any(test, feature = "pg_test"))]
 pub fn compile_count() -> u64 {
     COMPILES.get()
 }
@@ -112,7 +116,10 @@ pub fn compile_count() -> u64 {
 /// backend's own; must run in a transaction.
 pub fn invalidate() {
     // SAFETY: IsTransactionState only reads backend-local transaction state.
-    debug_assert!(unsafe { pg_sys::IsTransactionState() }, "invalidate() outside a transaction");
+    debug_assert!(
+        unsafe { pg_sys::IsTransactionState() },
+        "invalidate() outside a transaction"
+    );
     let relid = registry::relid();
     REGISTRY_RELID.set(Some(relid));
     OWN_PENDING.set(true);
@@ -123,7 +130,12 @@ pub fn invalidate() {
 /// Registers the relcache, transaction and subtransaction callbacks; called once from `_PG_init`.
 pub fn register_callbacks() {
     // SAFETY: the callback has the required signature and lives for the process.
-    unsafe { pg_sys::CacheRegisterRelcacheCallback(Some(on_relcache_invalidation), pg_sys::Datum::from(0usize)) }
+    unsafe {
+        pg_sys::CacheRegisterRelcacheCallback(
+            Some(on_relcache_invalidation),
+            pg_sys::Datum::from(0usize),
+        )
+    }
     // SAFETY: the callback has the required signature, lives for the process and ignores `arg`.
     unsafe { pg_sys::RegisterXactCallback(Some(on_xact_end), ptr::null_mut()) }
     // SAFETY: the callback has the required signature, lives for the process and ignores `arg`.
@@ -133,7 +145,10 @@ pub fn register_callbacks() {
 /// Relcache callback. Relevant: `InvalidOid`, any relid while the registry relid is
 /// unknown, else exactly the registry relid.
 #[pg_guard]
-pub(crate) unsafe extern "C-unwind" fn on_relcache_invalidation(_arg: pg_sys::Datum, relid: pg_sys::Oid) {
+pub(crate) unsafe extern "C-unwind" fn on_relcache_invalidation(
+    _arg: pg_sys::Datum,
+    relid: pg_sys::Oid,
+) {
     let known = REGISTRY_RELID.try_with(Cell::get).ok().flatten();
     let relevant = relid == pg_sys::InvalidOid || known.is_none_or(|r| r == relid);
     if !relevant {
@@ -148,11 +163,18 @@ pub(crate) unsafe extern "C-unwind" fn on_relcache_invalidation(_arg: pg_sys::Da
 
 /// Transaction callback: resets the per-transaction state at transaction end.
 #[pg_guard]
-pub(crate) unsafe extern "C-unwind" fn on_xact_end(event: pg_sys::XactEvent::Type, _arg: *mut std::ffi::c_void) {
+pub(crate) unsafe extern "C-unwind" fn on_xact_end(
+    event: pg_sys::XactEvent::Type,
+    _arg: *mut std::ffi::c_void,
+) {
     use pg_sys::XactEvent::*;
     if matches!(
         event,
-        XACT_EVENT_COMMIT | XACT_EVENT_ABORT | XACT_EVENT_PREPARE | XACT_EVENT_PARALLEL_COMMIT | XACT_EVENT_PARALLEL_ABORT
+        XACT_EVENT_COMMIT
+            | XACT_EVENT_ABORT
+            | XACT_EVENT_PREPARE
+            | XACT_EVENT_PARALLEL_COMMIT
+            | XACT_EVENT_PARALLEL_ABORT
     ) {
         let _ = INVALIDATED_THIS_XACT.try_with(|f| f.set(false));
         let _ = OWN_PENDING.try_with(|o| o.set(false));

@@ -27,8 +27,8 @@ pub struct Row {
 
 fn select_row(query: &str, args: &[DatumWithOid]) -> Option<Row> {
     Spi::connect(|client| {
-        let table = client.select(query, Some(1), args)?;
-        for row in table {
+        let mut table = client.select(query, Some(1), args)?;
+        if let Some(row) = table.next() {
             let id = row.get::<i64>(1)?.expect("id is NOT NULL");
             let JsonB(schema) = row.get::<JsonB>(2)?.expect("schema is NOT NULL");
             return Ok::<_, pgrx::spi::Error>(Some(Row { id, schema }));
@@ -57,11 +57,11 @@ pub fn lookup_by_uri(uri: &str) -> Option<Row> {
 /// or the value is NULL.
 fn select_one<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -> Option<T> {
     Spi::connect(|client| {
-        let table = client.select(query, Some(1), args)?;
-        for row in table {
-            return row.get::<T>(1);
+        let mut table = client.select(query, Some(1), args)?;
+        match table.next() {
+            Some(row) => row.get::<T>(1),
+            None => Ok::<_, pgrx::spi::Error>(None),
         }
-        Ok::<_, pgrx::spi::Error>(None)
     })
     .expect("registry read failed")
 }
@@ -95,13 +95,13 @@ pub fn insert_schema(name: &str, version: i32, schema: &serde_json::Value, draft
 /// does; a caller that bypasses the lock gets the raw unique violation.
 pub fn insert_id(uri: &str, schema_id: i64) -> Result<(), String> {
     let owner = Spi::connect(|client| {
-        let table = client.select(
+        let mut table = client.select(
             "SELECT r.name, r.version FROM jsonschema.ids i \
              JOIN jsonschema.registry r ON r.id = i.schema_id WHERE i.uri = $1",
             Some(1),
             &[DatumWithOid::from(uri)],
         )?;
-        for row in table {
+        if let Some(row) = table.next() {
             let name = row.get::<String>(1)?.expect("name is NOT NULL");
             let version = row.get::<i32>(2)?.expect("version is NOT NULL");
             return Ok::<_, pgrx::spi::Error>(Some((name, version)));
@@ -110,7 +110,9 @@ pub fn insert_id(uri: &str, schema_id: i64) -> Result<(), String> {
     })
     .expect("registry owner lookup failed");
     if let Some((name, version)) = owner {
-        return Err(format!("$id {uri} is already registered by {name}/{version}"));
+        return Err(format!(
+            "$id {uri} is already registered by {name}/{version}"
+        ));
     }
     Spi::run_with_args(
         "INSERT INTO jsonschema.ids (uri, schema_id) VALUES ($1, $2)",
@@ -130,7 +132,7 @@ pub fn insert_ref(schema_id: i64, ref_id: i64) {
 
 pub fn dependents(id: i64) -> Vec<(String, i32)> {
     Spi::connect(|client| {
-        let table = client.select(
+        let mut table = client.select(
             "SELECT r.name, r.version FROM jsonschema.refs f \
              JOIN jsonschema.registry r ON r.id = f.schema_id \
              WHERE f.ref_id = $1 ORDER BY r.name, r.version",
@@ -138,7 +140,7 @@ pub fn dependents(id: i64) -> Vec<(String, i32)> {
             &[DatumWithOid::from(id)],
         )?;
         let mut out = Vec::new();
-        for row in table {
+        if let Some(row) = table.next() {
             let name = row.get::<String>(1)?.expect("name is NOT NULL");
             let version = row.get::<i32>(2)?.expect("version is NOT NULL");
             out.push((name, version));
@@ -150,15 +152,15 @@ pub fn dependents(id: i64) -> Vec<(String, i32)> {
 
 pub fn delete(name: &str, version: i32) -> Option<i64> {
     Spi::connect_mut(|client| {
-        let table = client.update(
+        let mut table = client.update(
             "DELETE FROM jsonschema.registry WHERE name = $1 AND version = $2 RETURNING id",
             Some(1),
             &[DatumWithOid::from(name), DatumWithOid::from(version)],
         )?;
-        for row in table {
-            return Ok::<_, pgrx::spi::Error>(row.get::<i64>(1)?);
+        match table.next() {
+            Some(row) => row.get::<i64>(1),
+            None => Ok::<_, pgrx::spi::Error>(None),
         }
-        Ok(None)
     })
     .expect("registry delete failed")
 }
@@ -201,7 +203,12 @@ mod tests {
         assert!(crate::registry::insert_id("https://x.example/s", a).is_ok());
         let err = crate::registry::insert_id("https://x.example/s", b).unwrap_err();
         assert!(err.contains("a/1"), "{err}");
-        assert_eq!(crate::registry::lookup_by_uri("https://x.example/s").unwrap().id, a);
+        assert_eq!(
+            crate::registry::lookup_by_uri("https://x.example/s")
+                .unwrap()
+                .id,
+            a
+        );
     }
 
     #[pg_test]
@@ -219,18 +226,29 @@ mod tests {
     #[pg_test]
     fn reads_do_not_assign_a_transaction_id() {
         let xid = || unsafe { pg_sys::GetCurrentTransactionIdIfAny() };
-        assert_eq!(xid(), pg_sys::InvalidTransactionId, "test harness already assigned an XID");
+        assert_eq!(
+            xid(),
+            pg_sys::InvalidTransactionId,
+            "test harness already assigned an XID"
+        );
         let _ = crate::registry::relid();
         let _ = crate::registry::max_version("nope");
         let _ = crate::registry::lookup("nope", 1);
         let _ = crate::registry::lookup_by_uri("https://nope.example/");
         let _ = crate::registry::dependents(0);
-        assert_eq!(xid(), pg_sys::InvalidTransactionId, "a registry read assigned an XID");
+        assert_eq!(
+            xid(),
+            pg_sys::InvalidTransactionId,
+            "a registry read assigned an XID"
+        );
     }
 
     #[pg_test]
     fn relid_is_the_registry_table() {
         let oid = crate::registry::relid();
-        assert_eq!(Spi::get_one::<pg_sys::Oid>("SELECT 'jsonschema.registry'::regclass::oid"), Ok(Some(oid)));
+        assert_eq!(
+            Spi::get_one::<pg_sys::Oid>("SELECT 'jsonschema.registry'::regclass::oid"),
+            Ok(Some(oid))
+        );
     }
 }

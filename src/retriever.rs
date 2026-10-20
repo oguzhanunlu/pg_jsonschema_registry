@@ -1,7 +1,6 @@
 //! Resolves `$ref`s against the registry: `urn:pg-jsonschema-registry:<name>:<version>`
 //! and any `$id` URI recorded in `jsonschema.ids`. No network or filesystem access.
 
-use pgrx::prelude::*;
 use std::sync::{Arc, Mutex};
 
 pub const URN_PREFIX: &str = "urn:pg-jsonschema-registry:";
@@ -42,15 +41,24 @@ impl jsonschema::Retrieve for RegistryRetriever {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use pgrx::prelude::*;
 
     #[pg_test]
     fn parse_urn_accepts_name_and_version() {
-        assert_eq!(crate::retriever::parse_urn("urn:pg-jsonschema-registry:order:3"), Some(("order".into(), 3)));
-        assert_eq!(crate::retriever::parse_urn("urn:pg-jsonschema-registry:com.acme:order:3"), Some(("com.acme:order".into(), 3)));
-        assert_eq!(crate::retriever::parse_urn("urn:pg-jsonschema-registry:order"), None);
+        assert_eq!(
+            crate::retriever::parse_urn("urn:pg-jsonschema-registry:order:3"),
+            Some(("order".into(), 3))
+        );
+        assert_eq!(
+            crate::retriever::parse_urn("urn:pg-jsonschema-registry:com.acme:order:3"),
+            Some(("com.acme:order".into(), 3))
+        );
+        assert_eq!(
+            crate::retriever::parse_urn("urn:pg-jsonschema-registry:order"),
+            None
+        );
         assert_eq!(crate::retriever::parse_urn("https://x.example/order"), None);
     }
 }

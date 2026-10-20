@@ -24,9 +24,18 @@ mod tests {
 
     #[pg_test]
     fn bootstrap_creates_empty_registry_tables() {
-        assert_eq!(Spi::get_one::<i64>("SELECT count(*) FROM jsonschema.registry"), Ok(Some(0)));
-        assert_eq!(Spi::get_one::<i64>("SELECT count(*) FROM jsonschema.ids"), Ok(Some(0)));
-        assert_eq!(Spi::get_one::<i64>("SELECT count(*) FROM jsonschema.refs"), Ok(Some(0)));
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM jsonschema.registry"),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM jsonschema.ids"),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM jsonschema.refs"),
+            Ok(Some(0))
+        );
     }
 
     #[pg_test]

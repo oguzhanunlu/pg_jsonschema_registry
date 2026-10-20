@@ -18,12 +18,18 @@ impl RawJsonb {
 }
 
 impl FromDatum for RawJsonb {
-    unsafe fn from_polymorphic_datum(datum: pg_sys::Datum, is_null: bool, _typoid: pg_sys::Oid) -> Option<Self> {
+    unsafe fn from_polymorphic_datum(
+        datum: pg_sys::Datum,
+        is_null: bool,
+        _typoid: pg_sys::Oid,
+    ) -> Option<Self> {
         if is_null {
             return None;
         }
         // SAFETY: a non-null jsonb datum is a (possibly toasted) varlena pointer.
-        Some(RawJsonb(unsafe { pg_sys::pg_detoast_datum_packed(datum.cast_mut_ptr()) }))
+        Some(RawJsonb(unsafe {
+            pg_sys::pg_detoast_datum_packed(datum.cast_mut_ptr())
+        }))
     }
 }
 
@@ -32,7 +38,8 @@ unsafe impl<'fcx> ArgAbi<'fcx> for RawJsonb {
     unsafe fn unbox_arg_unchecked(arg: Arg<'_, 'fcx>) -> Self {
         let index = arg.index();
         // SAFETY: the argument's SQL type is jsonb, which FromDatum above expects.
-        unsafe { arg.unbox_arg_using_from_datum() }.unwrap_or_else(|| panic!("argument {index} must not be null"))
+        unsafe { arg.unbox_arg_using_from_datum() }
+            .unwrap_or_else(|| panic!("argument {index} must not be null"))
     }
 }
 
