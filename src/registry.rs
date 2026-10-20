@@ -1,7 +1,7 @@
 //! SQL access to the registry tables. This is the only module that runs SQL
 //! against `jsonschema.registry`, `jsonschema.ids` and `jsonschema.refs`.
 
-// Some functions are consumed only by later modules (register, cache, unregister).
+// `lookup`, `dependents`, `delete` etc. are consumed by later modules.
 #![allow(dead_code)]
 
 use pgrx::datum::DatumWithOid;

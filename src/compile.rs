@@ -1,6 +1,6 @@
 //! Schema compilation with registry-backed `$ref` resolution.
 
-// Consumed by later modules (register, cache, valid).
+// `Compiled::validator` is consumed by later modules (cache, valid).
 #![allow(dead_code)]
 
 use crate::retriever::RegistryRetriever;

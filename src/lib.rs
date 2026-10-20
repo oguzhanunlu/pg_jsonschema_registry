@@ -2,6 +2,7 @@ use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!(name, version);
 
+mod api;
 mod compile;
 mod registry;
 mod retriever;
