@@ -252,6 +252,27 @@ mod tests {
     }
 
     #[pg_test]
+    fn subxact_abort_resets_own_invalidation_marker() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        // One command that runs register (queuing its own invalidation) and then fails,
+        // so the subtransaction aborts before that command's local messages are processed.
+        Spi::run(
+            "DO $$ BEGIN \
+               PERFORM 1 / (jsonschema.register('q', '{}') - 1); \
+             EXCEPTION WHEN division_by_zero THEN NULL; END $$",
+        )
+        .unwrap();
+        assert_eq!(Spi::get_one::<i64>("SELECT count(*) FROM jsonschema.registry WHERE name = 'q'"), Ok(Some(0)));
+        // SAFETY: simulates Postgres delivering a foreign invalidation of the registry.
+        unsafe { crate::cache::on_relcache_invalidation(pg_sys::Datum::from(0usize), crate::registry::relid()) };
+        let before = crate::cache::compile_count();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        assert_eq!(crate::cache::compile_count(), before + 2);
+    }
+
+    #[pg_test]
     fn unknown_relid_treats_any_relcache_message_as_relevant() {
         reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
         crate::cache::reset_for_test();

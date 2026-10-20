@@ -15,7 +15,8 @@
 //! *own* change is always visible to its own snapshot, so [`invalidate`] marks its
 //! message as own (`OWN_PENDING`) and the callback consumes that mark instead of
 //! setting the flag. Postgres deduplicates a relid's local relcache messages within a
-//! command, so one bool matches one callback firing.
+//! command, so one bool matches one callback firing. A transaction or subtransaction
+//! abort discards the current command's messages, so the mark is reset there too.
 //!
 //! Relevance: `InvalidOid` (all relations) is relevant; while the registry relid is
 //! still unknown in this backend every relcache message is treated as relevant
@@ -119,12 +120,14 @@ pub fn invalidate() {
     unsafe { pg_sys::CacheInvalidateRelcacheByRelid(relid) }
 }
 
-/// Registers the relcache and transaction callbacks; called once from `_PG_init`.
+/// Registers the relcache, transaction and subtransaction callbacks; called once from `_PG_init`.
 pub fn register_callbacks() {
     // SAFETY: the callback has the required signature and lives for the process.
     unsafe { pg_sys::CacheRegisterRelcacheCallback(Some(on_relcache_invalidation), pg_sys::Datum::from(0usize)) }
     // SAFETY: the callback has the required signature, lives for the process and ignores `arg`.
     unsafe { pg_sys::RegisterXactCallback(Some(on_xact_end), ptr::null_mut()) }
+    // SAFETY: the callback has the required signature, lives for the process and ignores `arg`.
+    unsafe { pg_sys::RegisterSubXactCallback(Some(on_subxact), ptr::null_mut()) }
 }
 
 /// Relcache callback. Relevant: `InvalidOid`, any relid while the registry relid is
@@ -152,6 +155,22 @@ pub(crate) unsafe extern "C-unwind" fn on_xact_end(event: pg_sys::XactEvent::Typ
         XACT_EVENT_COMMIT | XACT_EVENT_ABORT | XACT_EVENT_PREPARE | XACT_EVENT_PARALLEL_COMMIT | XACT_EVENT_PARALLEL_ABORT
     ) {
         let _ = INVALIDATED_THIS_XACT.try_with(|f| f.set(false));
+        let _ = OWN_PENDING.try_with(|o| o.set(false));
+    }
+}
+
+/// Subtransaction callback: on subtransaction abort the current command's local
+/// messages are discarded, so a pending own mark would never be consumed and could
+/// later swallow a foreign invalidation. Reset it; a still-pending parent message is
+/// then treated as foreign, which is conservative.
+#[pg_guard]
+unsafe extern "C-unwind" fn on_subxact(
+    event: pg_sys::SubXactEvent::Type,
+    _my_subid: pg_sys::SubTransactionId,
+    _parent_subid: pg_sys::SubTransactionId,
+    _arg: *mut std::ffi::c_void,
+) {
+    if event == pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB {
         let _ = OWN_PENDING.try_with(|o| o.set(false));
     }
 }
