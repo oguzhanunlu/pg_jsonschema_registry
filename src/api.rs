@@ -2,8 +2,15 @@
 
 use pgrx::prelude::*;
 
+/// Raises an ERROR with `code` and `msg`; never returns.
+pub(crate) fn fail(code: PgSqlErrorCode, msg: String) -> ! {
+    pgrx::pg_sys::panic::ErrorReport::new(code, msg, function_name!()).report(PgLogLevel::ERROR);
+    unreachable!("ERROR does not return")
+}
+
 #[pg_schema]
 mod jsonschema {
+    use super::fail;
     use crate::raw::RawJsonb;
     use crate::{cache, compile, registry};
     use jsonschema::json::Jsonb;
@@ -23,11 +30,6 @@ mod jsonschema {
     #[pg_extern(stable, strict, parallel_safe)]
     fn valid(doc: RawJsonb, name: &str, version: i32) -> bool {
         cache::get_or_compile(name, version).is_valid(Jsonb::root(doc.as_bytes()))
-    }
-
-    fn fail(code: PgSqlErrorCode, msg: String) -> ! {
-        pgrx::pg_sys::panic::ErrorReport::new(code, msg, function_name!()).report(PgLogLevel::ERROR);
-        unreachable!("ERROR does not return")
     }
 
     fn do_register(name: &str, version: Option<i32>, schema: serde_json::Value) -> i32 {
@@ -204,9 +206,46 @@ mod tests {
     #[pg_test]
     fn valid_handles_toasted_documents() {
         reg("SELECT jsonschema.register('big', '{\"type\":\"object\",\"properties\":{\"blob\":{\"type\":\"string\",\"minLength\":100000}}}')").unwrap();
-        Spi::run("CREATE TABLE docs(d jsonb)").unwrap();
-        Spi::run("INSERT INTO docs SELECT jsonb_build_object('blob', repeat('x', 200000))").unwrap();
-        Spi::run("INSERT INTO docs SELECT jsonb_build_object('blob', repeat('y', 10))").unwrap();
-        assert_eq!(Spi::get_one::<i64>("SELECT count(*) FROM docs WHERE jsonschema.valid(d, 'big', 1)"), Ok(Some(1)));
+        reg("SELECT jsonschema.register('obj', '{\"type\":\"object\",\"required\":[\"blob\"]}')").unwrap();
+        // Out-of-line, uncompressed (EXTERNAL), plus a small inline row with a 1-byte header.
+        Spi::run("CREATE TABLE docs(id int, d jsonb)").unwrap();
+        Spi::run("ALTER TABLE docs ALTER d SET STORAGE EXTERNAL").unwrap();
+        Spi::run("INSERT INTO docs VALUES (1, jsonb_build_object('blob', repeat('x', 200000)))").unwrap();
+        Spi::run("INSERT INTO docs VALUES (2, jsonb_build_object('blob', repeat('y', 10)))").unwrap();
+        let toast = Spi::get_one::<String>("SELECT reltoastrelid::regclass::text FROM pg_class WHERE oid = 'docs'::regclass").unwrap().unwrap();
+        assert!(Spi::get_one::<i64>(&format!("SELECT count(*) FROM {toast}")).unwrap().unwrap() > 0, "big row is not out of line");
+        assert_eq!(Spi::get_one::<bool>("SELECT pg_column_size(d) < 127 FROM docs WHERE id = 2"), Ok(Some(true)));
+        // Compressed (default EXTENDED storage, repetitive data).
+        Spi::run("CREATE TABLE docs_c(d jsonb)").unwrap();
+        Spi::run("INSERT INTO docs_c SELECT jsonb_build_object('blob', repeat('z', 200000))").unwrap();
+        assert_eq!(Spi::get_one::<bool>("SELECT pg_column_size(d) < octet_length(d::text) FROM docs_c"), Ok(Some(true)));
+
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid(d, 'big', 1) FROM docs WHERE id = 1"), Ok(Some(true)));
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid(d, 'big', 1) FROM docs WHERE id = 2"), Ok(Some(false)));
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid(d, 'obj', 1) FROM docs WHERE id = 2"), Ok(Some(true)));
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid(d, 'big', 1) FROM docs_c"), Ok(Some(true)));
+    }
+
+    #[pg_test]
+    fn invalidation_in_transaction_disables_cache_fill() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        Spi::run("DELETE FROM jsonschema.registry WHERE name='p'").unwrap();   // unregister() arrives in Task 7
+        crate::cache::invalidate();
+        reg("SELECT jsonschema.register('p', 1, '{\"type\":\"array\"}')").unwrap();
+        let before = crate::cache::compile_count();
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p', 1)"), Ok(Some(true)));
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p', 1)"), Ok(Some(true)));
+        assert_eq!(crate::cache::compile_count(), before + 2);
+    }
+
+    #[pg_test]
+    fn unrelated_relcache_invalidation_keeps_cache() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        let before = crate::cache::compile_count();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        Spi::run("CREATE TABLE other_t(x int)").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        assert_eq!(crate::cache::compile_count(), before + 1);
     }
 }
