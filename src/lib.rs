@@ -3,11 +3,18 @@ use pgrx::prelude::*;
 ::pgrx::pg_module_magic!(name, version);
 
 mod api;
+mod cache;
 mod compile;
+mod raw;
 mod registry;
 mod retriever;
 
 extension_sql_file!("../sql/bootstrap.sql", name = "bootstrap", bootstrap);
+
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    cache::register_callback();
+}
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]

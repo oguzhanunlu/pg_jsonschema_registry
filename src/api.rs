@@ -4,7 +4,9 @@ use pgrx::prelude::*;
 
 #[pg_schema]
 mod jsonschema {
-    use crate::{compile, registry};
+    use crate::raw::RawJsonb;
+    use crate::{cache, compile, registry};
+    use jsonschema::json::Jsonb;
     use pgrx::prelude::*;
     use pgrx::JsonB;
 
@@ -16,6 +18,11 @@ mod jsonschema {
     #[pg_extern(volatile, strict, parallel_unsafe, name = "register")]
     fn register_version(name: &str, version: i32, schema: JsonB) -> i32 {
         do_register(name, Some(version), schema.0)
+    }
+
+    #[pg_extern(stable, strict, parallel_safe)]
+    fn valid(doc: RawJsonb, name: &str, version: i32) -> bool {
+        cache::get_or_compile(name, version).is_valid(Jsonb::root(doc.as_bytes()))
     }
 
     fn fail(code: PgSqlErrorCode, msg: String) -> ! {
@@ -52,6 +59,7 @@ mod jsonschema {
         for r in compiled.refs.iter().filter(|r| **r != id) {
             registry::insert_ref(id, *r);
         }
+        cache::invalidate();
         version
     }
 }
@@ -139,5 +147,66 @@ mod tests {
             .catch_when(PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE, |_| Some(()))
             .execute();
         assert_eq!(code, Some(()));
+    }
+
+    #[pg_test]
+    fn valid_answers_true_and_false() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\",\"required\":[\"id\"],\"properties\":{\"id\":{\"type\":\"integer\"}}}')").unwrap();
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('{\"id\":1}', 'p', 1)"), Ok(Some(true)));
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('{\"id\":\"x\"}', 'p', 1)"), Ok(Some(false)));
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)"), Ok(Some(false)));
+    }
+
+    #[pg_test(error = "schema p version 9 is not registered")]
+    fn valid_raises_for_unknown_schema() {
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 9)").unwrap();
+    }
+
+    #[pg_test]
+    fn valid_compiles_once_per_backend() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        let before = crate::cache::compile_count();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{\"a\":1}', 'p', 1)").unwrap();
+        Spi::get_one::<i64>("SELECT count(*) FROM generate_series(1,100) g WHERE jsonschema.valid('{}', 'p', 1)").unwrap();
+        assert_eq!(crate::cache::compile_count(), before + 1);
+    }
+
+    #[pg_test]
+    fn register_invalidates_warm_cache_in_same_backend() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p', 1)"), Ok(Some(false)));
+        let before = crate::cache::compile_count();
+        Spi::run("DELETE FROM jsonschema.registry WHERE name='p'").unwrap();   // unregister() arrives in Task 7
+        crate::cache::invalidate();
+        reg("SELECT jsonschema.register('p', 1, '{\"type\":\"array\"}')").unwrap();
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p', 1)"), Ok(Some(true)));
+        assert_eq!(crate::cache::compile_count(), before + 1);
+    }
+
+    #[pg_test(error = "schema p version 1 is not registered")]
+    fn delete_in_warm_backend_makes_valid_raise() {
+        reg("SELECT jsonschema.register('p', '{}')").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        Spi::run("DELETE FROM jsonschema.registry WHERE name='p'").unwrap();
+        crate::cache::invalidate();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+    }
+
+    #[pg_test]
+    fn valid_follows_cross_schema_ref_with_fragment() {
+        reg("SELECT jsonschema.register('address', '{\"$id\":\"https://acme.example/address\",\"$defs\":{\"street\":{\"type\":\"string\",\"minLength\":1}}}')").unwrap();
+        reg("SELECT jsonschema.register('order', '{\"properties\":{\"street\":{\"$ref\":\"https://acme.example/address#/$defs/street\"}}}')").unwrap();
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('{\"street\":\"Main\"}', 'order', 1)"), Ok(Some(true)));
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('{\"street\":\"\"}', 'order', 1)"), Ok(Some(false)));
+    }
+
+    #[pg_test]
+    fn valid_handles_toasted_documents() {
+        reg("SELECT jsonschema.register('big', '{\"type\":\"object\",\"properties\":{\"blob\":{\"type\":\"string\",\"minLength\":100000}}}')").unwrap();
+        Spi::run("CREATE TABLE docs(d jsonb)").unwrap();
+        Spi::run("INSERT INTO docs SELECT jsonb_build_object('blob', repeat('x', 200000))").unwrap();
+        Spi::run("INSERT INTO docs SELECT jsonb_build_object('blob', repeat('y', 10))").unwrap();
+        assert_eq!(Spi::get_one::<i64>("SELECT count(*) FROM docs WHERE jsonschema.valid(d, 'big', 1)"), Ok(Some(1)));
     }
 }

@@ -1,8 +1,5 @@
 //! Schema compilation with registry-backed `$ref` resolution.
 
-// `Compiled::validator` is consumed by later modules (cache, valid).
-#![allow(dead_code)]
-
 use crate::retriever::RegistryRetriever;
 use jsonschema::json::Jsonb;
 use pgrx::prelude::*;
