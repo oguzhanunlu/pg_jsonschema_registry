@@ -209,6 +209,10 @@ CREATE TRIGGER refs_changed AFTER INSERT OR DELETE ON jsonschema.refs
             Some(v) if v <= max => fail(BAD, format!("version must be greater than {max}")),
             Some(v) => v,
         };
+        let top_level_id = match crate::retriever::top_level_id(&schema) {
+            Ok(id) => id,
+            Err(msg) => fail(BAD, msg),
+        };
         if let Err(e) = ::jsonschema::meta::validate(&schema) {
             fail(BAD, format!("invalid JSON Schema: {e}"));
         }
@@ -217,8 +221,8 @@ CREATE TRIGGER refs_changed AFTER INSERT OR DELETE ON jsonschema.refs
             Err(e) => fail(BAD, format!("cannot compile schema: {e}")),
         };
         let id = registry::insert_schema(name, version, &schema, compiled.draft);
-        if let Some(uri) = schema.get("$id").and_then(|v| v.as_str()) {
-            if let Err(msg) = registry::insert_id(uri, id) {
+        if let Some(uri) = top_level_id {
+            if let Err(msg) = registry::insert_id(&uri, id) {
                 fail(PgSqlErrorCode::ERRCODE_DUPLICATE_OBJECT, msg);
             }
         }
@@ -343,6 +347,85 @@ mod tests {
             Spi::get_one::<Vec<String>>("SELECT refs FROM jsonschema.schemas WHERE name='order'"),
             Ok(Some(vec!["address/1".into()]))
         );
+    }
+
+    #[pg_test]
+    fn id_with_empty_fragment_is_referenceable_with_and_without_it() {
+        reg("SELECT jsonschema.register('a', '{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"$id\":\"http://example.com/a.json#\",\"type\":\"integer\"}')").unwrap();
+        assert_eq!(
+            Spi::get_one::<String>("SELECT id_uri FROM jsonschema.schemas WHERE name = 'a'"),
+            Ok(Some("http://example.com/a.json".into()))
+        );
+        reg("SELECT jsonschema.register('b', '{\"$ref\":\"http://example.com/a.json\"}')").unwrap();
+        reg("SELECT jsonschema.register('c', '{\"$ref\":\"http://example.com/a.json#\"}')")
+            .unwrap();
+        for n in ["b", "c"] {
+            assert_eq!(
+                Spi::get_one::<bool>(&format!("SELECT jsonschema.valid('1', '{n}', 1)")),
+                Ok(Some(true))
+            );
+            assert_eq!(
+                Spi::get_one::<bool>(&format!("SELECT jsonschema.valid('\"x\"', '{n}', 1)")),
+                Ok(Some(false))
+            );
+        }
+    }
+
+    #[pg_test]
+    fn draft4_id_is_referenceable() {
+        reg("SELECT jsonschema.register('d4', '{\"$schema\":\"http://json-schema.org/draft-04/schema#\",\"id\":\"http://example.com/d4.json#\",\"type\":\"string\"}')").unwrap();
+        reg("SELECT jsonschema.register('user', '{\"properties\":{\"s\":{\"$ref\":\"http://example.com/d4.json\"}}}')").unwrap();
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT jsonschema.valid('{\"s\":1}', 'user', 1)"),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT jsonschema.valid('{\"s\":\"x\"}', 'user', 1)"),
+            Ok(Some(true))
+        );
+    }
+
+    #[pg_test]
+    fn id_is_stored_normalized_and_resolves_as_written() {
+        reg("SELECT jsonschema.register('n', '{\"$id\":\"HTTPS://Example.COM:443/s/../n\",\"type\":\"string\"}')").unwrap();
+        assert_eq!(
+            Spi::get_one::<String>("SELECT id_uri FROM jsonschema.schemas WHERE name = 'n'"),
+            Ok(Some("https://example.com/n".into()))
+        );
+        reg("SELECT jsonschema.register('m', '{\"$ref\":\"HTTPS://Example.COM:443/s/../n\"}')")
+            .unwrap();
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT jsonschema.valid('1', 'm', 1)"),
+            Ok(Some(false))
+        );
+    }
+
+    #[pg_test]
+    fn relative_id_is_rejected() {
+        let msg = error_message("SELECT jsonschema.register('r', '{\"$id\":\"a.json\"}')");
+        assert_eq!(msg, "top-level $id must be an absolute URI");
+    }
+
+    #[pg_test]
+    fn id_with_fragment_is_rejected() {
+        let msg = error_message(
+            "SELECT jsonschema.register('f', '{\"$id\":\"http://x.example/a#foo\"}')",
+        );
+        assert_eq!(msg, "top-level $id must not contain a fragment");
+    }
+
+    #[pg_test]
+    fn bad_id_sqlstate_is_22023() {
+        let code = PgTryBuilder::new(|| {
+            reg("SELECT jsonschema.register('r', '{\"$id\":\"a.json\"}')").unwrap();
+            None
+        })
+        .catch_when(
+            PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+            |_| Some(()),
+        )
+        .execute();
+        assert_eq!(code, Some(()));
     }
 
     #[pg_test]

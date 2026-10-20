@@ -131,7 +131,7 @@ All functions are in schema `jsonschema`, and every function that takes argument
 | `latest_version(name)` | `int` | stable, parallel safe | Highest registered version of `name`. |
 | `cache_stats()` | `table(compiles bigint, entries int, invalidations bigint)` | stable, parallel safe | Cache counters of the calling backend; see [Caching and consistency](#caching-and-consistency). |
 
-Tables and view (all in schema `jsonschema`, readable by everyone): `registry` (one row per name and version, with the schema, detected draft, creator and creation time), `ids` (the top-level `$id` of each schema that has one), `refs` (which schema references which), and the view `schemas` that joins them.
+Tables and view (all in schema `jsonschema`, readable by everyone): `registry` (one row per name and version, with the schema, detected draft, creator and creation time), `ids` (the normalized top-level `$id` of each schema that has one), `refs` (which schema references which), and the view `schemas` that joins them.
 
 Errors and SQLSTATEs:
 
@@ -142,6 +142,8 @@ Errors and SQLSTATEs:
 | `register`: version not above the current maximum | `22023` | `version must be greater than <max>` |
 | `register`: schema is not a valid JSON Schema | `22023` | `invalid JSON Schema: ...` |
 | `register`: schema does not compile (for example a `$ref` that is not registered) | `22023` | `cannot compile schema: ...` |
+| `register`: top-level `$id` is relative | `22023` | `top-level $id must be an absolute URI` |
+| `register`: top-level `$id` has a non-empty fragment | `22023` | `top-level $id must not contain a fragment` |
 | `register`: the `$id` is already registered | `42710` | `$id <uri> is already registered by <name>/<version>` |
 | `register` / `unregister`: caller lacks table privileges | `42501` | PostgreSQL's permission denied error |
 | `unregister`: version is referenced by other schemas | `2BP01` | `schema <name> version <v> is referenced by <name>/<v>, ...` |
@@ -228,6 +230,7 @@ Compiled from each project's README as of 2026-10; check them for current detail
 
 ## Limitations
 
+- The top-level identifier (`$id`, or `id` for draft 4) must be an absolute URI (with a scheme) and must not carry a fragment; a trailing empty fragment (`"http://example.com/a.json#"`) is dropped. It is stored in `jsonschema.ids` in RFC 3986 syntax-normalized form (scheme and host lowercased, default port and `.`/`..` path segments removed), because the validator normalizes every `$ref` the same way before looking it up. A `$ref` resolves when it normalizes to exactly the stored URI, with or without an empty fragment; nothing else is folded (the path is case-sensitive, and `http` and `https` are different URIs).
 - Only a schema's top-level `$id` can be referenced. An `$id` embedded in a subschema is not registered, so other schemas cannot `$ref` it.
 - References are resolved against the registry only. There are no remote (HTTP or file) refs, ever.
 - `unregister` checks references from other registered schemas, not from `CHECK` constraints. If a table constraint calls `validate(doc, 'name', 1)` and you unregister that version, the constraint starts raising `schema ... is not registered`.
