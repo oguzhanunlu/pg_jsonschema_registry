@@ -2,7 +2,9 @@ use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!(name, version);
 
+mod compile;
 mod registry;
+mod retriever;
 
 extension_sql_file!("../sql/bootstrap.sql", name = "bootstrap", bootstrap);
 
