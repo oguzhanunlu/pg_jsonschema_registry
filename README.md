@@ -114,7 +114,7 @@ SELECT jsonschema.unregister('address', 1);
 
 ## Function reference
 
-All functions are in schema `jsonschema`, and all are `STRICT` (a NULL argument returns NULL). `doc` is `jsonb`; `name` is `text`; `version` is `int`.
+All functions are in schema `jsonschema`, and every function that takes arguments is `STRICT` (a NULL argument returns NULL). `doc` is `jsonb`; `name` is `text`; `version` is `int`.
 
 | Function | Returns | Volatility | Notes |
 |---|---|---|---|
@@ -129,6 +129,7 @@ All functions are in schema `jsonschema`, and all are `STRICT` (a NULL argument 
 | `validate(doc, name)` | `boolean` | stable, parallel safe | Same, for the latest version. |
 | `get(name, version)` | `jsonb` | stable, parallel safe | The stored schema. |
 | `latest_version(name)` | `int` | stable, parallel safe | Highest registered version of `name`. |
+| `cache_stats()` | `table(compiles bigint, entries int, invalidations bigint)` | stable, parallel safe | Cache counters of the calling backend; see [Caching and consistency](#caching-and-consistency). |
 
 Tables and view (all in schema `jsonschema`, readable by everyone): `registry` (one row per name and version, with the schema, detected draft, creator and creation time), `ids` (the top-level `$id` of each schema that has one), `refs` (which schema references which), and the view `schemas` that joins them.
 
@@ -166,9 +167,22 @@ For `validate`, the DETAIL line is `<n> error(s): [...]` with every error as a J
 
 Each backend keeps its own cache of compiled validators, keyed by schema name and version. `register` and `unregister` queue a relcache invalidation of `jsonschema.registry`, which PostgreSQL delivers to every backend, and the backend clears its cache when it processes it.
 
-The guarantee: the validator that is served always matches the registry row that the current transaction's snapshot sees, with the same consistency semantics PostgreSQL gives its own relcache and syscache. `register` and `unregister` are transactional, so a rolled-back registration is never served, and a registration becomes visible to other sessions when it commits. In a transaction that observes a concurrent registry change, validators are recompiled on each call for the rest of that transaction; this affects performance only, not results.
+The guarantee: the validator that is served always matches the registry row that the current transaction's snapshot sees, with the same consistency semantics PostgreSQL gives its own relcache and syscache. `register` and `unregister` are transactional, so a rolled-back registration is never served, and a registration becomes visible to other sessions when it commits.
+
+A backend usually processes another session's registry change at the start of its next transaction, before that transaction takes a snapshot, and then caches normally. Only a transaction that processes a registry change after it has taken its first snapshot (a change that its snapshot may predate, for example one committed while the transaction was open) stops caching, and recompiles validators on each call for the rest of that transaction; the next transaction caches again. This affects performance only, not results.
 
 A cached validator is never served after the backend has processed an invalidation for the registry. The details are in the module documentation of [`src/cache.rs`](src/cache.rs).
+
+`jsonschema.cache_stats()` shows the cache counters of the calling backend (each connection has its own numbers):
+
+```sql
+SELECT * FROM jsonschema.cache_stats();
+--  compiles | entries | invalidations
+-- ----------+---------+---------------
+--         3 |       2 |             1
+```
+
+`compiles` is the number of schema compilations this backend has done, `entries` the number of validators cached now, and `invalidations` how many times a registry invalidation cleared the cache.
 
 ## Backup and restore
 

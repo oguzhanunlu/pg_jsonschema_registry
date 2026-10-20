@@ -107,6 +107,25 @@ mod jsonschema {
         }
     }
 
+    /// Per-backend cache counters: total compiles, cached validators, and how many
+    /// registry invalidations cleared the cache. Numbers are for the calling backend only.
+    #[pg_extern(stable, parallel_safe)]
+    fn cache_stats() -> TableIterator<
+        'static,
+        (
+            name!(compiles, i64),
+            name!(entries, i32),
+            name!(invalidations, i64),
+        ),
+    > {
+        let clamp = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        TableIterator::once((
+            clamp(cache::compile_count()),
+            i32::try_from(cache::entry_count()).unwrap_or(i32::MAX),
+            clamp(cache::invalidation_count()),
+        ))
+    }
+
     #[pg_extern(volatile, strict, parallel_unsafe)]
     fn unregister(name: &str, version: i32) {
         let Some(row) = registry::lookup(name, version) else {
@@ -514,6 +533,28 @@ mod tests {
         Spi::run("CREATE TABLE other_t(x int)").unwrap();
         Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
         assert_eq!(crate::cache::compile_count(), before + 1);
+    }
+
+    #[pg_test]
+    fn cache_stats_reports_this_backends_counters() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        let stats = || {
+            Spi::get_three::<i64, i32, i64>(
+                "SELECT compiles, entries, invalidations FROM jsonschema.cache_stats()",
+            )
+            .unwrap()
+        };
+        let (c0, _, i0) = stats();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        let (c1, e1, i1) = stats();
+        assert_eq!(c1, c0.map(|c| c + 1));
+        assert_eq!(e1, Some(1));
+        assert_eq!(i1, i0);
+        reg("SELECT jsonschema.register('p', '{}')").unwrap();
+        let (_, e2, i2) = stats();
+        assert_eq!(e2, Some(0));
+        assert!(i2 > i1, "{i2:?} > {i1:?}");
     }
 
     #[pg_test]

@@ -1,20 +1,33 @@
 //! Per-backend cache of compiled validators keyed by `(name, version)`.
 //!
 //! Invalidation: `register`/`unregister` call [`invalidate`], which queues a relcache
-//! invalidation of `jsonschema.registry`. Postgres delivers it to every backend at
-//! commit (and to this backend at command end or abort), and
-//! [`on_relcache_invalidation`] clears the map and bumps a generation counter.
-//! [`get_or_compile`] calls `AcceptInvalidationMessages()` first, so the hit path
-//! observes committed registry changes at the same point Postgres's own catalog
+//! invalidation of `jsonschema.registry`. Postgres delivers the message to every
+//! backend at commit (and to this backend at command end or abort), and
+//! [`on_relcache_invalidation`] clears the map and bumps a generation counter. [`get_or_compile`] calls `AcceptInvalidationMessages()` first, so the hit
+//! path observes committed registry changes at the same point Postgres's own catalog
 //! caches do.
 //!
-//! Own vs foreign: a transaction whose snapshot predates a *foreign* registry change
-//! could re-read the old row after the map was cleared. So a relevant invalidation
-//! sets a per-transaction flag (reset by [`on_xact_end`]), and a validator compiled
-//! while it is set is used for the current call but never cached. This backend's
-//! *own* change is always visible to its own snapshot, so [`invalidate`] marks its
-//! message as own (`OWN_PENDING`) and the callback consumes that mark instead of
-//! setting the flag. Postgres deduplicates a relid's local relcache messages within a
+//! Stale snapshots: a transaction whose snapshot predates a registry change could
+//! re-read the old row after the map was cleared. So a relevant invalidation that this
+//! transaction may not see sets a per-transaction flag (reset by [`on_xact_end`]), and
+//! a validator compiled while it is set is used for the current call but never cached.
+//! The flag is set only when the message is processed *after* this transaction took its
+//! first snapshot (`IsTransactionState() && FirstSnapshotSet`):
+//!
+//! - A committing backend makes its commit visible (`ProcArrayEndTransaction`) before it
+//!   sends its invalidation messages (`AtEOXact_Inval`), so a message processed before
+//!   this transaction's first snapshot belongs to a change that snapshot sees. That
+//!   covers the common case, messages read at transaction start (`AtStart_Cache`, at
+//!   `TRANS_START`), including this backend's own committed messages, which come back
+//!   through the shared queue.
+//! - At abort, `AtEOXact_Inval(false)` replays this transaction's earlier messages
+//!   locally after the `XACT_EVENT_ABORT` callback, in state `TRANS_ABORT`; the gate keeps
+//!   that from leaking the flag into the next transaction.
+//!
+//! Own vs foreign within a transaction: this backend's own change is always visible to
+//! its own snapshot, so [`invalidate`] marks its message as own (`OWN_PENDING`) and the
+//! callback consumes that mark instead of setting the flag when the message is processed
+//! at command end. Postgres deduplicates a relid's local relcache messages within a
 //! command, so one bool matches one callback firing. A transaction or subtransaction
 //! abort discards the current command's messages, so the mark is reset there too.
 //!
@@ -24,8 +37,8 @@
 //!
 //! Guarantee: a cached validator is never served after this backend has processed a
 //! relevant invalidation, and a validator is inserted only if no relevant foreign
-//! invalidation was processed in the current transaction and none arrived while it
-//! was being compiled.
+//! invalidation was processed after the current transaction's first snapshot and none
+//! arrived while it was being compiled.
 //!
 //! The callbacks run no SQL and cannot panic: they only touch thread-locals,
 //! through `try_with` / `try_borrow_mut`.
@@ -46,6 +59,8 @@ type ValidatorMap = HashMap<(String, i32), Arc<Validator<Jsonb>>>;
 thread_local! {
     static CACHE: RefCell<ValidatorMap> = RefCell::new(HashMap::new());
     static COMPILES: Cell<u64> = const { Cell::new(0) };
+    /// Number of times a relevant invalidation cleared the map.
+    static INVALIDATIONS: Cell<u64> = const { Cell::new(0) };
     /// Bumped by every relevant invalidation; a compile that straddles one is not cached.
     static GENERATION: Cell<u64> = const { Cell::new(0) };
     /// The registry's relid, refreshed on every miss (the callback must not run SQL).
@@ -106,10 +121,19 @@ pub fn clear() {
     }
 }
 
-/// Number of compiles done by [`get_or_compile`] in this backend (test observability).
-#[cfg(any(test, feature = "pg_test"))]
+/// Number of compiles done by [`get_or_compile`] in this backend.
 pub fn compile_count() -> u64 {
     COMPILES.get()
+}
+
+/// Number of validators currently cached in this backend.
+pub fn entry_count() -> usize {
+    CACHE.with_borrow(|c| c.len())
+}
+
+/// Number of relevant invalidations this backend has processed (each cleared the map).
+pub fn invalidation_count() -> u64 {
+    INVALIDATIONS.get()
 }
 
 /// Queues a relcache invalidation for `jsonschema.registry`, marked as this
@@ -155,8 +179,12 @@ pub(crate) unsafe extern "C-unwind" fn on_relcache_invalidation(
         return;
     }
     let _ = GENERATION.try_with(|g| g.set(g.get().wrapping_add(1)));
+    let _ = INVALIDATIONS.try_with(|n| n.set(n.get().wrapping_add(1)));
     clear();
-    if OWN_PENDING.try_with(|o| o.replace(false)) == Ok(false) {
+    let own = OWN_PENDING.try_with(|o| o.replace(false)) == Ok(true);
+    // SAFETY: both only read backend-local state; FirstSnapshotSet is a plain global.
+    let after_snapshot = unsafe { pg_sys::IsTransactionState() && pg_sys::FirstSnapshotSet };
+    if !own && after_snapshot {
         let _ = INVALIDATED_THIS_XACT.try_with(|f| f.set(true));
     }
 }

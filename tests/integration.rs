@@ -6,14 +6,10 @@
 //! `PGJSR_TEST_DSN="host=localhost port=5432 dbname=pgjsr_it" cargo test --test integration -- --ignored --test-threads=1`.
 //!
 //! Every test uses its own schema and table names, but run them with
-//! `--test-threads=1` (the script does): a backend that reads a registry
-//! invalidation from another backend skips the cache fill for the rest of that
-//! transaction, so a concurrent test's commit can keep a cache cold and turn a
-//! hit-path check into a miss-path check, which would pass vacuously.
-//!
-//! For the same reason a backend first [`absorb`]s pending invalidations (its own
-//! earlier commits come back through the shared queue too) before a call that
-//! is meant to fill its cache.
+//! `--test-threads=1` (the script does): a backend that processes a registry
+//! invalidation after its transaction's first snapshot skips the cache fill for the
+//! rest of that transaction, so a concurrent test's commit can keep a cache cold and
+//! turn a hit-path check into a miss-path check, which would pass vacuously.
 
 use postgres::error::SqlState;
 use postgres::{Client, NoTls};
@@ -41,12 +37,21 @@ fn cleanup(c: &mut Client, names: &[&str]) {
     }
 }
 
-/// Reads pending shared invalidations in a transaction of its own (locking the
-/// registry does `AcceptInvalidationMessages`), so the next transaction starts
-/// with nothing pending and its first miss fills the cache.
-fn absorb(c: &mut Client) {
-    c.batch_execute("SELECT count(*) FROM jsonschema.registry")
-        .unwrap();
+/// `jsonschema.cache_stats().compiles` of this backend.
+fn compiles<C: postgres::GenericClient>(c: &mut C) -> i64 {
+    c.query_one("SELECT compiles FROM jsonschema.cache_stats()", &[])
+        .unwrap()
+        .get(0)
+}
+
+/// `jsonschema.valid(doc, name, 1)` through any client or transaction.
+fn valid_in<C: postgres::GenericClient>(c: &mut C, doc: &str, name: &str) -> bool {
+    c.query_one(
+        "SELECT jsonschema.valid($1::text::jsonb, $2, 1)",
+        &[&doc, &name],
+    )
+    .unwrap()
+    .get(0)
 }
 
 fn sqlstate(e: &postgres::Error) -> Option<&SqlState> {
@@ -64,7 +69,6 @@ fn other_backend_sees_reregistered_schema() {
         &[],
     )
     .unwrap();
-    absorb(&mut b);
     assert!(!valid(&mut b, "[]")); // b's cache now holds the object schema
     a.execute("SELECT jsonschema.unregister('p', 1)", &[])
         .unwrap();
@@ -85,7 +89,6 @@ fn rolled_back_register_leaves_no_phantom() {
     let mut a = client();
     let mut b = client();
     cleanup(&mut a, &["ph"]);
-    absorb(&mut a);
     let mut tx = a.transaction().unwrap();
     // a's own change: visible to its snapshot, so the next call fills the cache.
     tx.execute(
@@ -174,9 +177,10 @@ fn open_read_committed_transaction_sees_committed_change_on_hit_path() {
         &[],
     )
     .unwrap();
-    absorb(&mut a);
+    // a's own register message comes back through the shared queue at the start of
+    // this transaction, before its first snapshot, so it does not disable caching.
     let mut tx = a.transaction().unwrap();
-    // Miss with nothing pending: compiles and caches; the next call is a hit.
+    // Miss: compiles and caches; the next call is a hit.
     let warm: bool = tx
         .query_one("SELECT jsonschema.valid('[]', 'rc', 1)", &[])
         .unwrap()
@@ -246,4 +250,103 @@ fn valid_runs_in_parallel_workers() {
         .unwrap()
         .get(0);
     assert_eq!(n, 50000);
+}
+
+#[test]
+#[ignore]
+fn autocommit_register_does_not_disable_caching_in_next_transaction() {
+    let mut a = client();
+    cleanup(&mut a, &["ac"]);
+    a.execute(
+        "SELECT jsonschema.register('ac', 1, '{\"type\":\"object\"}')",
+        &[],
+    )
+    .unwrap();
+    let mut tx = a.transaction().unwrap();
+    let before = compiles(&mut tx);
+    for _ in 0..3 {
+        assert!(valid_in(&mut tx, "{}", "ac"));
+    }
+    assert_eq!(
+        compiles(&mut tx) - before,
+        1,
+        "the backend's own committed register must not disable caching in its next transaction"
+    );
+    tx.commit().unwrap();
+}
+
+#[test]
+#[ignore]
+fn foreign_change_disables_caching_only_within_the_transaction_that_observed_it() {
+    let mut a = client();
+    let mut b = client();
+    cleanup(&mut a, &["x"]);
+    a.execute(
+        "SELECT jsonschema.register('x', 1, '{\"type\":\"object\"}')",
+        &[],
+    )
+    .unwrap();
+    assert!(!valid_in(&mut a, "[]", "x")); // warm
+    b.execute("SELECT jsonschema.unregister('x', 1)", &[])
+        .unwrap();
+    b.execute(
+        "SELECT jsonschema.register('x', 1, '{\"type\":\"array\"}')",
+        &[],
+    )
+    .unwrap();
+    // b's messages are processed at the start of a's transaction, before its snapshot.
+    let mut tx = a.transaction().unwrap();
+    let before = compiles(&mut tx);
+    assert!(valid_in(&mut tx, "[]", "x"));
+    assert!(valid_in(&mut tx, "[]", "x"));
+    assert_eq!(compiles(&mut tx) - before, 1);
+    tx.commit().unwrap();
+
+    // Observed inside a transaction, after its snapshot: no caching for the rest of it,
+    // and caching again in the next transaction.
+    let mut tx = a.transaction().unwrap();
+    assert!(valid_in(&mut tx, "[]", "x")); // snapshot taken, cache hit
+    b.execute("SELECT jsonschema.unregister('x', 1)", &[])
+        .unwrap();
+    b.execute(
+        "SELECT jsonschema.register('x', 1, '{\"type\":\"object\"}')",
+        &[],
+    )
+    .unwrap();
+    let before = compiles(&mut tx);
+    assert!(!valid_in(&mut tx, "[]", "x"));
+    assert!(!valid_in(&mut tx, "[]", "x"));
+    assert_eq!(compiles(&mut tx) - before, 2);
+    tx.commit().unwrap();
+    let mut tx = a.transaction().unwrap();
+    let before = compiles(&mut tx);
+    assert!(!valid_in(&mut tx, "[]", "x"));
+    assert!(!valid_in(&mut tx, "[]", "x"));
+    assert_eq!(compiles(&mut tx) - before, 1);
+    tx.commit().unwrap();
+}
+
+/// A rolled-back registration replays its messages locally during abort, after the
+/// transaction-end callback; that must not disable caching in the next transaction.
+#[test]
+#[ignore]
+fn aborted_register_does_not_disable_caching_in_next_transaction() {
+    let mut a = client();
+    cleanup(&mut a, &["ab", "ab2"]);
+    a.execute(
+        "SELECT jsonschema.register('ab', 1, '{\"type\":\"object\"}')",
+        &[],
+    )
+    .unwrap();
+    let mut tx = a.transaction().unwrap();
+    tx.execute("SELECT jsonschema.register('ab2', 1, '{}')", &[])
+        .unwrap();
+    tx.execute("SELECT 1", &[]).unwrap(); // a later command: the message is now a prior-command one
+    tx.rollback().unwrap();
+    let mut tx = a.transaction().unwrap();
+    let before = compiles(&mut tx);
+    assert!(valid_in(&mut tx, "{}", "ab"));
+    assert!(valid_in(&mut tx, "{}", "ab"));
+    assert_eq!(compiles(&mut tx) - before, 1);
+    tx.commit().unwrap();
 }
