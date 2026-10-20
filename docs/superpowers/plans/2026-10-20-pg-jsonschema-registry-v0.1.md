@@ -815,6 +815,36 @@ fn rolled_back_register_leaves_no_phantom() {
 }
 
 #[test] #[ignore]
+fn repeatable_read_sees_its_snapshot_then_the_new_schema() {
+    let mut a = client(); let mut b = client();
+    a.execute("SELECT jsonschema.register('rr', 1, '{\"type\":\"object\"}')", &[]).unwrap();
+    let mut tx = a.transaction().unwrap();
+    tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", &[]).unwrap();
+    tx.execute("SELECT 1", &[]).unwrap();                                   // snapshot taken
+    b.execute("SELECT jsonschema.unregister('rr', 1)", &[]).unwrap();
+    b.execute("SELECT jsonschema.register('rr', 1, '{\"type\":\"array\"}')", &[]).unwrap();
+    let old: bool = tx.query_one("SELECT jsonschema.valid('[]', 'rr', 1)", &[]).unwrap().get(0);
+    assert!(!old, "inside the RR transaction the OLD schema (object) must apply");
+    tx.commit().unwrap();
+    let new: bool = a.query_one("SELECT jsonschema.valid('[]', 'rr', 1)", &[]).unwrap().get(0);
+    assert!(new, "after the RR transaction the NEW schema (array) must apply, not a cached stale one");
+}
+
+#[test] #[ignore]
+fn open_read_committed_transaction_sees_committed_change_on_hit_path() {
+    let mut a = client(); let mut b = client();
+    a.execute("SELECT jsonschema.register('rc', 1, '{\"type\":\"object\"}')", &[]).unwrap();
+    let mut tx = a.transaction().unwrap();
+    let warm: bool = tx.query_one("SELECT jsonschema.valid('[]', 'rc', 1)", &[]).unwrap().get(0);
+    assert!(!warm);
+    b.execute("SELECT jsonschema.unregister('rc', 1)", &[]).unwrap();
+    b.execute("SELECT jsonschema.register('rc', 1, '{\"type\":\"array\"}')", &[]).unwrap();
+    let after: bool = tx.query_one("SELECT jsonschema.valid('[]', 'rc', 1)", &[]).unwrap().get(0);
+    assert!(after, "a hit inside an open READ COMMITTED transaction must observe B's committed change");
+    tx.commit().unwrap();
+}
+
+#[test] #[ignore]
 fn valid_runs_in_parallel_workers() {
     let mut c = client();
     c.batch_execute("SELECT jsonschema.register('par', 1, '{\"type\":\"object\",\"required\":[\"i\"]}'); \
@@ -834,7 +864,7 @@ with helpers `client()` and `valid(&mut Client, doc) -> bool` (`SELECT jsonschem
 - [ ] **Step 2: Run them**
 
 Run: `scripts/integration-test.sh`
-Expected: `test result: ok. 3 passed`. If the parallel test's plan has no `Parallel Seq Scan`, paste the plan into a GitHub issue and keep the count assertion; do not change `parallel_safe` without understanding why the planner refused.
+Expected: `test result: ok. 5 passed`. If the parallel test's plan has no `Parallel Seq Scan`, paste the plan into a GitHub issue and keep the count assertion; do not change `parallel_safe` without understanding why the planner refused.
 
 - [ ] **Step 3: Write and run `scripts/dump-restore-test.sh`**
 
