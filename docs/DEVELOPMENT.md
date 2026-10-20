@@ -128,6 +128,54 @@ Notes:
 - Plain `cargo build` / `cargo clippy` also work and are faster for checking
   compile errors, but they do not install or test anything.
 
+## Integration tests
+
+Two scripts test what `#[pg_test]` cannot: several backends at once, and a
+real `pg_dump` / `pg_restore`. Both run against **the Homebrew service on port
+5432**, which must be running (`brew services start postgresql@18`,
+`pg_isready`). Both work from any directory and are safe to rerun.
+
+```sh
+scripts/integration-test.sh     # multi-session cache coherence + parallel workers
+scripts/dump-restore-test.sh    # CHECK (jsonschema.validate(...)) survives dump/restore
+```
+
+`scripts/integration-test.sh` runs `cargo pgrx install` into the tree
+`PG_CONFIG` points at, drops and recreates the database **`pgjsr_it`**, runs
+`CREATE EXTENSION pg_jsonschema_registry` there, then
+`cargo test --test integration -- --ignored --test-threads=1`. The tests in
+`tests/integration.rs` are `#[ignore]`d, so plain `cargo test` and
+`cargo pgrx test` skip them. They connect with the `postgres` crate, two
+clients being two backends. `--test-threads=1` matters: a concurrent test's
+registry commit can keep another test's cache cold, which would let a
+hit-path check pass without exercising the hit path. To run them by hand
+against an existing database with the extension installed:
+
+```sh
+PGJSR_TEST_DSN="host=localhost port=5432 dbname=pgjsr_it" \
+  cargo test --test integration -- --ignored --test-threads=1
+```
+
+`scripts/dump-restore-test.sh` creates **`pgjsr_dump`** (extension, schema
+`p` version 1, a table with a `CHECK (jsonschema.validate(payload, 'p', 1))`
+and 3 rows), dumps it with `pg_dump -Fc`, restores into **`pgjsr_restore`**,
+and checks the rows, the registry and that the constraint still rejects
+`'{}'`. It drops both databases at the start and at exit, and prints
+`dump/restore OK`. It runs the check twice: once with the table in `public`
+and a plain `pg_restore`, and once with the table in schema `app` using the
+ordered recipe (`--section=pre-data`; `--data-only --schema=jsonschema`;
+`--section=data --exclude-schema=jsonschema`; `--section=post-data`). The
+second case exists because pg_dump orders table data by schema name: a table
+in a schema that sorts before `jsonschema` has its data restored before the
+registry rows, and a plain restore then fails.
+
+Environment variables:
+
+| Variable | Default | Used by |
+|---|---|---|
+| `PG_CONFIG` | `/opt/homebrew/opt/postgresql@18/bin/pg_config` | both scripts (install target, client binaries via `--bindir`) |
+| `PGJSR_TEST_DSN` | `host=localhost port=5432 dbname=pgjsr_it` | `integration-test.sh`, `tests/integration.rs` |
+
 ## Version coupling to remember
 
 - The `pgrx` version in `Cargo.toml` and the installed `cargo-pgrx` must
