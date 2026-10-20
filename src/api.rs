@@ -66,6 +66,63 @@ mod jsonschema {
         )
     }
 
+    #[pg_extern(stable, strict, parallel_safe, name = "valid")]
+    fn valid_latest(doc: RawJsonb, name: &str) -> bool {
+        valid(doc, name, latest_version(name))
+    }
+
+    #[pg_extern(stable, strict, parallel_safe, name = "errors")]
+    fn errors_latest(doc: RawJsonb, name: &str) -> JsonB {
+        errors(doc, name, latest_version(name))
+    }
+
+    #[pg_extern(stable, strict, parallel_safe, name = "validate")]
+    fn validate_latest(doc: RawJsonb, name: &str) -> bool {
+        validate(doc, name, latest_version(name))
+    }
+
+    #[pg_extern(stable, strict, parallel_safe)]
+    fn get(name: &str, version: i32) -> JsonB {
+        match registry::lookup(name, version) {
+            Some(row) => JsonB(row.schema),
+            None => fail(
+                PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
+                format!("schema {name} version {version} is not registered"),
+            ),
+        }
+    }
+
+    #[pg_extern(stable, strict, parallel_safe)]
+    fn latest_version(name: &str) -> i32 {
+        match registry::max_version(name) {
+            0 => fail(
+                PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
+                format!("schema {name} has no registered versions"),
+            ),
+            v => v,
+        }
+    }
+
+    #[pg_extern(volatile, strict, parallel_unsafe)]
+    fn unregister(name: &str, version: i32) {
+        let Some(row) = registry::lookup(name, version) else {
+            fail(
+                PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
+                format!("schema {name} version {version} is not registered"),
+            );
+        };
+        let deps = registry::dependents(row.id);
+        if !deps.is_empty() {
+            let list: Vec<String> = deps.iter().map(|(n, v)| format!("{n}/{v}")).collect();
+            fail(
+                PgSqlErrorCode::ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("schema {name} version {version} is referenced by {}", list.join(", ")),
+            );
+        }
+        registry::delete(name, version);
+        cache::invalidate();
+    }
+
     fn do_register(name: &str, version: Option<i32>, schema: serde_json::Value) -> i32 {
         const BAD: PgSqlErrorCode = PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE;
         if name.is_empty() {
@@ -213,8 +270,7 @@ mod tests {
         reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
         assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p', 1)"), Ok(Some(false)));
         let before = crate::cache::compile_count();
-        Spi::run("DELETE FROM jsonschema.registry WHERE name='p'").unwrap();   // unregister() arrives in Task 7
-        crate::cache::invalidate();
+        Spi::run("SELECT jsonschema.unregister('p', 1)").unwrap();
         reg("SELECT jsonschema.register('p', 1, '{\"type\":\"array\"}')").unwrap();
         assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p', 1)"), Ok(Some(true)));
         assert_eq!(crate::cache::compile_count(), before + 1);
@@ -224,8 +280,7 @@ mod tests {
     fn delete_in_warm_backend_makes_valid_raise() {
         reg("SELECT jsonschema.register('p', '{}')").unwrap();
         Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
-        Spi::run("DELETE FROM jsonschema.registry WHERE name='p'").unwrap();
-        crate::cache::invalidate();
+        Spi::run("SELECT jsonschema.unregister('p', 1)").unwrap();
         Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
     }
 
@@ -383,5 +438,49 @@ mod tests {
             .catch_when(PgSqlErrorCode::ERRCODE_CHECK_VIOLATION, |_| true)
             .execute();
         assert!(rejected);
+    }
+
+    #[pg_test]
+    fn get_and_latest_version() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        reg("SELECT jsonschema.register('p', '{\"type\":\"array\"}')").unwrap();
+        assert_eq!(Spi::get_one::<i32>("SELECT jsonschema.latest_version('p')"), Ok(Some(2)));
+        let s = Spi::get_one::<pgrx::JsonB>("SELECT jsonschema.get('p', 1)").unwrap().unwrap();
+        assert_eq!(s.0, serde_json::json!({"type":"object"}));
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p')"), Ok(Some(true)));
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p', 1)"), Ok(Some(false)));
+    }
+
+    #[pg_test(error = "schema p version 3 is not registered")]
+    fn get_unknown_raises() { Spi::get_one::<pgrx::JsonB>("SELECT jsonschema.get('p', 3)").unwrap(); }
+
+    #[pg_test(error = "schema nope has no registered versions")]
+    fn latest_version_unknown_raises() { Spi::get_one::<i32>("SELECT jsonschema.latest_version('nope')").unwrap(); }
+
+    #[pg_test]
+    fn unregister_removes_and_allows_reregistration() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        Spi::run("SELECT jsonschema.unregister('p', 1)").unwrap();
+        assert_eq!(Spi::get_one::<i64>("SELECT count(*) FROM jsonschema.registry WHERE name='p'"), Ok(Some(0)));
+        assert_eq!(reg("SELECT jsonschema.register('p', 1, '{\"type\":\"array\"}')"), Ok(Some(1)));
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p', 1)"), Ok(Some(true)));
+    }
+
+    #[pg_test]
+    fn unregister_blocked_by_dependent() {
+        reg("SELECT jsonschema.register('address', '{\"type\":\"object\"}')").unwrap();
+        reg("SELECT jsonschema.register('order', '{\"$ref\":\"urn:pg-jsonschema-registry:address:1\"}')").unwrap();
+        let msg = error_message("SELECT jsonschema.unregister('address', 1)");
+        assert!(msg.contains("is referenced by order/1"), "{msg}");
+    }
+
+    #[pg_test]
+    fn unregister_sqlstate_is_2bp01() {
+        reg("SELECT jsonschema.register('address', '{}')").unwrap();
+        reg("SELECT jsonschema.register('order', '{\"$ref\":\"urn:pg-jsonschema-registry:address:1\"}')").unwrap();
+        let hit = PgTryBuilder::new(|| { Spi::run("SELECT jsonschema.unregister('address', 1)").unwrap(); false })
+            .catch_when(PgSqlErrorCode::ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST, |_| true)
+            .execute();
+        assert!(hit);
     }
 }
