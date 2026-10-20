@@ -60,9 +60,50 @@ resumes.
 - Bowtie is not applicable (it benchmarks validators, and ours is the
   crate's).
 
-## Upstream: `jsonschema` crate recursion guard (draft, not filed)
+## Outward actions left to the author
 
-The crate validates recursively with no depth guard. With
+Agents never open issues, push to shared branches, or publish on the
+author's behalf. These two were identified during v0.1 and are drafted here
+so they can be filed in a minute when the time comes.
+
+### 1. Repository issue: per-row overhead on small schemas (not filed)
+
+Context: the v0.1 benchmark (`docs/benchmarks.md`, run2, 2026-10-20,
+Docker on an M4 Pro, single client) measured our marginal cost per row at
+0.118 µs against 0.068 µs for pg_jsonschema `master`'s
+`jsonb_matches_compiled_schema` on a two-property schema; that is ~50 ns per
+row, 1.6–1.7× in that scenario, and 1.15× on a 100k-row `INSERT` with a
+`CHECK` constraint (11.1 vs 6.1 ms of constraint overhead). On the 3.4 MB
+FHIR schema the per-document costs are comparable (0.455 vs 0.531 µs).
+The plan's benchmark step said to open an issue for any row where we are
+slower.
+
+Suggested title: "valid() is ~50 ns/row slower than pg_jsonschema's
+compiled path on small schemas".
+
+Suggested body: the numbers above with a link to `docs/benchmarks.md`
+and the exact `bench/run.sh` invocation; the likely, unprofiled causes in
+`src/cache.rs::get_or_compile`: (a) `AcceptInvalidationMessages()` on
+every call, (b) a `String` allocation for the `(name, version)` cache key
+on every call, (c) a `HashMap` probe where pg_jsonschema uses a
+per-callsite `fn_extra` slot; proposed steps: profile with `perf` inside
+the benchmark container first, then try a borrowed-key lookup
+(`HashMap<(String, i32), _>` probed via `(&str, i32)` with the `hashbrown`
+raw-entry API or a two-level map), then an `fn_extra` callsite cache
+holding the `Arc<Validator>` plus the generation it was taken at, which
+would also remove the per-call `AcceptInvalidationMessages()` for the
+constant-argument case by piggybacking on the generation counter.
+Acceptance: the small-schema marginal cost within 10% of pg_jsonschema's,
+with the two-session coherence tests still passing.
+
+### 2. Upstream issue: `jsonschema` crate recursion guard (not filed)
+
+Target: github.com/Stranger6667/jsonschema (crate `jsonschema` 0.59.0).
+
+Suggested title: "No recursion limit during validation: deeply nested
+instances overflow the stack".
+
+Suggested body follows. The crate validates recursively with no depth guard. With
 `{"type":"array","items":{"$ref":"#"}}`, `iter_errors` overflowed an 8 MB
 stack at about 19 000 nesting levels and `is_valid` between 30 000 and
 40 000 (release build, standalone probe). Inside PostgreSQL a stack
@@ -72,4 +113,9 @@ margin is close to zero. This extension caps document nesting at 4096
 levels before validating, but the cap counts levels, not stack frames.
 Request: a configurable maximum nesting depth (or a `stacker`-style
 guard) in `Validator::is_valid`/`iter_errors`/`evaluate`, returning an
-error instead of overflowing. Repository: github.com/Stranger6667/jsonschema.
+error instead of overflowing. Include the standalone reproduction: a
+release-build binary that builds the validator for the recursive schema
+above and calls `iter_errors` on a `serde_json::Value` of nested arrays at
+increasing depth until it crashes; and note the Postgres angle (any
+database role that can insert into a table whose CHECK uses a recursive
+schema can trigger it).
