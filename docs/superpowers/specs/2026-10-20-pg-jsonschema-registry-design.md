@@ -24,8 +24,9 @@ our own table. Every hour goes into the registry.
    a list of errors, or by raising a descriptive `ERROR` (for constraints).
 3. `$ref` between registered schemas, resolved from the registry, never from
    the network or the filesystem.
-4. Compile each `(name, version)` once per backend and reuse it; the cache
-   can never serve a stale validator.
+4. Compile each `(name, version)` once per backend and reuse it; the served
+   validator always matches the registry row the current snapshot sees
+   (see Caching for the precise guarantee).
 5. Survive `pg_dump` / `pg_restore`, including databases whose tables carry
    `CHECK` constraints that call the registry.
 6. Measured, published performance against pg_jsonschema built from its
@@ -220,11 +221,41 @@ through Postgres's own mechanism rather than trusted:
   invalidation happens on registration events, not on validation. Spurious
   clears (VACUUM, DDL on the table) are harmless.
 
-The cost is zero on the validation path: backends already process pending
-invalidation messages at statement start. The behaviour is verified by a
-test with two sessions: session A validates (warming its cache), session B
-unregisters and re-registers under the same `(name, version)`, session A
-must see the new schema; and a rollback variant.
+**Snapshots (added 2026-10-20 after the Task 5 review found the hole).**
+Clearing the map is not enough on its own: a backend whose transaction
+snapshot predates a registry change can process the invalidation, miss,
+re-read the *old* row under its old snapshot (REPEATABLE READ, or a
+read-only statement whose snapshot SPI reuses), and would then cache a
+validator that is already stale for every later transaction. Two rules
+close this:
+
+1. The relcache callback also sets a per-transaction flag "registry
+   invalidated in this transaction"; a transaction-end callback (commit,
+   abort, prepare, and the parallel variants) resets it. A validator
+   compiled while the flag is set is used for the current call but never
+   inserted into the cache. The price is recompilation for the rest of that
+   one transaction, paid only when the registry changed concurrently.
+2. `get_or_compile` calls `AcceptInvalidationMessages()` before consulting
+   the cache, so the hit path observes committed registry changes at the
+   same point Postgres's own catalog caches do (every lock acquisition and
+   transaction start). It is a cheap shared-memory check when nothing is
+   pending.
+
+The precise guarantee, which replaces "can never be stale": the validator
+served always corresponds to the registry row visible to the current
+transaction's snapshot, with the same consistency semantics PostgreSQL
+gives its relcache and syscache. The remaining window (a committing
+backend has made its row visible but not yet sent its invalidation
+messages, and the reader took no conflicting lock) is the one Postgres
+itself accepts for catalog caches.
+
+Verified by two-session tests: (a) session A warms its cache, session B
+unregisters and re-registers under the same `(name, version)`, A must see
+the new schema; (b) a rollback variant; (c) A in REPEATABLE READ with a
+snapshot older than B's change must validate against the *old* schema
+during that transaction and against the new one in its next transaction;
+(d) A inside an open READ COMMITTED transaction, cache warm, must see B's
+committed change on its next call.
 
 Documents are validated in place through the crate's `Jsonb` representation
 (no `serde_json::Value` is built), following pg_jsonschema's `RawJsonb`
