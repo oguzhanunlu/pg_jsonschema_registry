@@ -1,5 +1,20 @@
 //! SQL access to the registry tables. This is the only module that runs SQL
 //! against `jsonschema.registry`, `jsonschema.ids` and `jsonschema.refs`.
+//!
+//! Rule: every read goes through the read-only SPI path,
+//! `Spi::connect(|client| client.select(..))`, never `Spi::get_one*` /
+//! `Spi::get_two*` / `Spi::run*` / `client.update`. Those execute through pgrx's
+//! read-write path, which assigns a transaction ID (`Spi::mark_mutable`) and runs
+//! the statement with `read_only = false`, which increments the command counter.
+//! `valid`, `errors`, `validate` and `latest_version` are `PARALLEL SAFE`, so these
+//! reads may run in a parallel worker (or in the leader in parallel mode), where
+//! either of those raises "cannot assign transaction IDs during a parallel
+//! operation" (25000). Assigning an XID would also make a cache miss fail on a hot
+//! standby and burn XIDs on read-only queries.
+//!
+//! Writes (`insert_*`, `delete`, `lock_for_register`) stay on the read-write path;
+//! they are reached only from `register` / `unregister`, which are
+//! `PARALLEL UNSAFE`.
 
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
@@ -38,12 +53,24 @@ pub fn lookup_by_uri(uri: &str) -> Option<Row> {
     )
 }
 
+/// First column of the first row of a read-only query, or `None` if there is no row
+/// or the value is NULL.
+fn select_one<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -> Option<T> {
+    Spi::connect(|client| {
+        let table = client.select(query, Some(1), args)?;
+        for row in table {
+            return row.get::<T>(1);
+        }
+        Ok::<_, pgrx::spi::Error>(None)
+    })
+    .expect("registry read failed")
+}
+
 pub fn max_version(name: &str) -> i32 {
-    Spi::get_one_with_args::<i32>(
+    select_one::<i32>(
         "SELECT COALESCE(max(version), 0)::int FROM jsonschema.registry WHERE name = $1",
         &[DatumWithOid::from(name)],
     )
-    .expect("registry max_version failed")
     .unwrap_or(0)
 }
 
@@ -142,8 +169,7 @@ pub fn lock_for_register() {
 }
 
 pub fn relid() -> pg_sys::Oid {
-    Spi::get_one::<pg_sys::Oid>("SELECT 'jsonschema.registry'::regclass::oid")
-        .expect("registry relid failed")
+    select_one::<pg_sys::Oid>("SELECT 'jsonschema.registry'::regclass::oid", &[])
         .expect("registry table not found")
 }
 
@@ -187,6 +213,19 @@ mod tests {
         assert_eq!(crate::registry::delete("b", 1), Some(b));
         assert!(crate::registry::dependents(a).is_empty());
         assert_eq!(crate::registry::delete("b", 1), None);
+    }
+
+    /// Reads must not assign a transaction ID (they may run in parallel workers).
+    #[pg_test]
+    fn reads_do_not_assign_a_transaction_id() {
+        let xid = || unsafe { pg_sys::GetCurrentTransactionIdIfAny() };
+        assert_eq!(xid(), pg_sys::InvalidTransactionId, "test harness already assigned an XID");
+        let _ = crate::registry::relid();
+        let _ = crate::registry::max_version("nope");
+        let _ = crate::registry::lookup("nope", 1);
+        let _ = crate::registry::lookup_by_uri("https://nope.example/");
+        let _ = crate::registry::dependents(0);
+        assert_eq!(xid(), pg_sys::InvalidTransactionId, "a registry read assigned an XID");
     }
 
     #[pg_test]

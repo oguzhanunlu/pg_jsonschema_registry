@@ -151,6 +151,7 @@ fn valid_runs_in_parallel_workers() {
         .map(|r| r.get::<_, String>(0))
         .collect::<Vec<_>>()
         .join("\n");
+    println!("EXPLAIN plan:\n{plan}");
     assert!(plan.contains("Parallel Seq Scan"), "{plan}");
     let analyzed = c
         .query("EXPLAIN (ANALYZE, COSTS OFF) SELECT count(*) FROM many WHERE jsonschema.valid(d, 'par', 1)", &[])
