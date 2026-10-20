@@ -2,6 +2,8 @@ use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!(name, version);
 
+mod registry;
+
 extension_sql_file!("../sql/bootstrap.sql", name = "bootstrap", bootstrap);
 
 #[cfg(any(test, feature = "pg_test"))]
