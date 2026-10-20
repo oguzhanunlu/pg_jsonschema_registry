@@ -8,9 +8,17 @@ pub(crate) fn fail(code: PgSqlErrorCode, msg: String) -> ! {
     unreachable!("ERROR does not return")
 }
 
+/// Raises an ERROR with `code`, `msg` and a DETAIL line; never returns.
+pub(crate) fn fail_with_detail(code: PgSqlErrorCode, msg: String, detail: String) -> ! {
+    pgrx::pg_sys::panic::ErrorReport::new(code, msg, function_name!())
+        .set_detail(detail)
+        .report(PgLogLevel::ERROR);
+    unreachable!("ERROR does not return")
+}
+
 #[pg_schema]
 mod jsonschema {
-    use super::fail;
+    use super::{fail, fail_with_detail};
     use crate::raw::RawJsonb;
     use crate::{cache, compile, registry};
     use jsonschema::json::Jsonb;
@@ -30,6 +38,32 @@ mod jsonschema {
     #[pg_extern(stable, strict, parallel_safe)]
     fn valid(doc: RawJsonb, name: &str, version: i32) -> bool {
         cache::get_or_compile(name, version).is_valid(Jsonb::root(doc.as_bytes()))
+    }
+
+    #[pg_extern(stable, strict, parallel_safe)]
+    fn errors(doc: RawJsonb, name: &str, version: i32) -> JsonB {
+        let v = cache::get_or_compile(name, version);
+        JsonB(serde_json::Value::Array(crate::errors::collect(&v, &doc)))
+    }
+
+    #[pg_extern(stable, strict, parallel_safe)]
+    fn validate(doc: RawJsonb, name: &str, version: i32) -> bool {
+        let v = cache::get_or_compile(name, version);
+        if v.is_valid(Jsonb::root(doc.as_bytes())) {
+            return true;
+        }
+        let errs = crate::errors::collect(&v, &doc);
+        let first = errs.first();
+        let field = |k: &str| first.and_then(|e| e[k].as_str()).unwrap_or("").to_string();
+        fail_with_detail(
+            PgSqlErrorCode::ERRCODE_CHECK_VIOLATION,
+            format!(
+                "document does not match schema {name} version {version}: {} at {}",
+                field("message"),
+                field("instance_path")
+            ),
+            format!("{} error(s): {}", errs.len(), serde_json::Value::Array(errs)),
+        )
     }
 
     fn do_register(name: &str, version: Option<i32>, schema: serde_json::Value) -> i32 {
@@ -297,5 +331,57 @@ mod tests {
         Spi::run("CREATE TABLE other_t(x int)").unwrap();
         Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
         assert_eq!(crate::cache::compile_count(), before + 1);
+    }
+
+    #[pg_test]
+    fn errors_is_empty_array_when_valid() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        let e = Spi::get_one::<pgrx::JsonB>("SELECT jsonschema.errors('{}', 'p', 1)").unwrap().unwrap();
+        assert_eq!(e.0, serde_json::json!([]));
+    }
+
+    #[pg_test]
+    fn errors_lists_every_failure_with_paths_and_keyword() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\",\"required\":[\"id\"],\"properties\":{\"n\":{\"minimum\":5}}}')").unwrap();
+        let e = Spi::get_one::<pgrx::JsonB>("SELECT jsonschema.errors('{\"n\":1}', 'p', 1)").unwrap().unwrap();
+        let arr = e.0.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let min = arr.iter().find(|x| x["keyword"] == "minimum").unwrap();
+        assert_eq!(min["instance_path"], "/n");
+        assert_eq!(min["schema_path"], "/properties/n/minimum");
+        assert!(min["message"].as_str().unwrap().contains("5"));
+        assert!(arr.iter().any(|x| x["keyword"] == "required" && x["instance_path"] == ""));
+    }
+
+    #[pg_test]
+    fn validate_returns_true_when_valid() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.validate('{}', 'p', 1)"), Ok(Some(true)));
+    }
+
+    #[pg_test]
+    fn validate_raises_check_violation_with_detail() {
+        reg("SELECT jsonschema.register('p', '{\"required\":[\"id\"]}')").unwrap();
+        let caught = PgTryBuilder::new(|| { Spi::get_one::<bool>("SELECT jsonschema.validate('{}', 'p', 1)").unwrap(); None })
+            .catch_when(PgSqlErrorCode::ERRCODE_CHECK_VIOLATION, |e| match e {
+                CaughtError::ErrorReport(r) | CaughtError::PostgresError(r) =>
+                    Some((r.message().to_string(), r.detail().unwrap_or("").to_string())),
+                _ => None,
+            })
+            .execute()
+            .expect("expected ERRCODE_CHECK_VIOLATION");
+        assert!(caught.0.contains("schema p version 1"), "{}", caught.0);
+        assert!(caught.1.contains("\"keyword\":\"required\"") || caught.1.contains("required"), "{}", caught.1);
+    }
+
+    #[pg_test]
+    fn validate_works_as_check_constraint() {
+        reg("SELECT jsonschema.register('p', '{\"required\":[\"id\"]}')").unwrap();
+        Spi::run("CREATE TABLE t (payload jsonb CHECK (jsonschema.validate(payload, 'p', 1)))").unwrap();
+        Spi::run("INSERT INTO t VALUES ('{\"id\":1}')").unwrap();
+        let rejected = PgTryBuilder::new(|| { Spi::run("INSERT INTO t VALUES ('{}')").unwrap(); false })
+            .catch_when(PgSqlErrorCode::ERRCODE_CHECK_VIOLATION, |_| true)
+            .execute();
+        assert!(rejected);
     }
 }
