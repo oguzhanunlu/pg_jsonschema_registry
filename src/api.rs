@@ -227,7 +227,19 @@ mod tests {
     }
 
     #[pg_test]
-    fn invalidation_in_transaction_disables_cache_fill() {
+    fn foreign_invalidation_disables_cache_fill_for_the_transaction() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        // SAFETY: simulates Postgres delivering a foreign invalidation of the registry.
+        unsafe { crate::cache::on_relcache_invalidation(pg_sys::Datum::from(0usize), crate::registry::relid()) };
+        let before = crate::cache::compile_count();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        assert_eq!(crate::cache::compile_count(), before + 2);
+    }
+
+    #[pg_test]
+    fn own_invalidation_keeps_cache_fill() {
         reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
         Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
         Spi::run("DELETE FROM jsonschema.registry WHERE name='p'").unwrap();   // unregister() arrives in Task 7
@@ -236,7 +248,24 @@ mod tests {
         let before = crate::cache::compile_count();
         assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p', 1)"), Ok(Some(true)));
         assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p', 1)"), Ok(Some(true)));
+        assert_eq!(crate::cache::compile_count(), before + 1);
+    }
+
+    #[pg_test]
+    fn unknown_relid_treats_any_relcache_message_as_relevant() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        crate::cache::reset_for_test();
+        Spi::run("CREATE TABLE other_t(x int)").unwrap();
+        let before = crate::cache::compile_count();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
         assert_eq!(crate::cache::compile_count(), before + 2);
+        // SAFETY: simulates the end of the transaction; the callback ignores `arg`.
+        unsafe { crate::cache::on_xact_end(pg_sys::XactEvent::XACT_EVENT_COMMIT, std::ptr::null_mut()) };
+        let before = crate::cache::compile_count();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        assert_eq!(crate::cache::compile_count(), before + 1);
     }
 
     #[pg_test]

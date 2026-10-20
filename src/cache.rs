@@ -1,18 +1,30 @@
 //! Per-backend cache of compiled validators keyed by `(name, version)`.
 //!
-//! Guarantee: a validator is never served from the cache after this backend has
-//! processed an invalidation of `jsonschema.registry`, and a validator is only
-//! inserted when no such invalidation was processed in the current transaction.
-//! `register`/`unregister` call [`invalidate`], which queues a relcache
-//! invalidation; Postgres delivers it to every backend at commit (and to this
-//! backend at command end or abort), and [`on_relcache_invalidation`] clears the map.
+//! Invalidation: `register`/`unregister` call [`invalidate`], which queues a relcache
+//! invalidation of `jsonschema.registry`. Postgres delivers it to every backend at
+//! commit (and to this backend at command end or abort), and
+//! [`on_relcache_invalidation`] clears the map and bumps a generation counter.
+//! [`get_or_compile`] calls `AcceptInvalidationMessages()` first, so the hit path
+//! observes committed registry changes at the same point Postgres's own catalog
+//! caches do.
 //!
-//! Snapshots: a transaction whose snapshot predates a registry change could re-read
-//! the old row after the map was cleared. So the callback also sets a
-//! per-transaction flag (reset by [`on_xact_end`]), and a validator compiled while
-//! it is set is used for the current call but never cached. [`get_or_compile`]
-//! calls `AcceptInvalidationMessages()` first, so the hit path observes committed
-//! registry changes at the same point Postgres's own catalog caches do.
+//! Own vs foreign: a transaction whose snapshot predates a *foreign* registry change
+//! could re-read the old row after the map was cleared. So a relevant invalidation
+//! sets a per-transaction flag (reset by [`on_xact_end`]), and a validator compiled
+//! while it is set is used for the current call but never cached. This backend's
+//! *own* change is always visible to its own snapshot, so [`invalidate`] marks its
+//! message as own (`OWN_PENDING`) and the callback consumes that mark instead of
+//! setting the flag. Postgres deduplicates a relid's local relcache messages within a
+//! command, so one bool matches one callback firing.
+//!
+//! Relevance: `InvalidOid` (all relations) is relevant; while the registry relid is
+//! still unknown in this backend every relcache message is treated as relevant
+//! (conservative); once known, only messages for that relid are.
+//!
+//! Guarantee: a cached validator is never served after this backend has processed a
+//! relevant invalidation, and a validator is inserted only if no relevant foreign
+//! invalidation was processed in the current transaction and none arrived while it
+//! was being compiled.
 //!
 //! The callbacks run no SQL and cannot panic: they only touch thread-locals,
 //! through `try_with` / `try_borrow_mut`.
@@ -34,8 +46,10 @@ thread_local! {
     static GENERATION: Cell<u64> = const { Cell::new(0) };
     /// The registry's relid, refreshed on every miss (the callback must not run SQL).
     static REGISTRY_RELID: Cell<Option<pg_sys::Oid>> = const { Cell::new(None) };
-    /// Set when the registry was invalidated in the current transaction; reset at transaction end.
-    static INVALIDATED_IN_XACT: Cell<bool> = const { Cell::new(false) };
+    /// Set by a relevant foreign invalidation in the current transaction; reset at transaction end.
+    static INVALIDATED_THIS_XACT: Cell<bool> = const { Cell::new(false) };
+    /// Set by `invalidate()`: the next relevant invalidation is this backend's own.
+    static OWN_PENDING: Cell<bool> = const { Cell::new(false) };
     /// Set when `clear()` could not borrow the map; the next `get_or_compile` clears first.
     static DIRTY: Cell<bool> = const { Cell::new(false) };
 }
@@ -72,7 +86,7 @@ pub fn get_or_compile(name: &str, version: i32) -> Arc<Validator<Jsonb>> {
     };
     COMPILES.set(COMPILES.get() + 1);
     let validator = Arc::new(compiled.validator);
-    if GENERATION.get() == generation && !INVALIDATED_IN_XACT.get() {
+    if GENERATION.get() == generation && !INVALIDATED_THIS_XACT.get() {
         CACHE.with_borrow_mut(|c| c.insert(key, Arc::clone(&validator)));
     }
     validator
@@ -93,11 +107,14 @@ pub fn compile_count() -> u64 {
     COMPILES.get()
 }
 
-/// Queues a relcache invalidation for `jsonschema.registry`; must run in a transaction.
+/// Queues a relcache invalidation for `jsonschema.registry`, marked as this
+/// backend's own; must run in a transaction.
 pub fn invalidate() {
     // SAFETY: IsTransactionState only reads backend-local transaction state.
     debug_assert!(unsafe { pg_sys::IsTransactionState() }, "invalidate() outside a transaction");
     let relid = registry::relid();
+    REGISTRY_RELID.set(Some(relid));
+    OWN_PENDING.set(true);
     // SAFETY: called inside a transaction with a valid relation oid.
     unsafe { pg_sys::CacheInvalidateRelcacheByRelid(relid) }
 }
@@ -110,26 +127,41 @@ pub fn register_callbacks() {
     unsafe { pg_sys::RegisterXactCallback(Some(on_xact_end), ptr::null_mut()) }
 }
 
-/// Relcache callback. `InvalidOid` means "all relations" (e.g. after an sinval overflow).
+/// Relcache callback. Relevant: `InvalidOid`, any relid while the registry relid is
+/// unknown, else exactly the registry relid.
 #[pg_guard]
-unsafe extern "C-unwind" fn on_relcache_invalidation(_arg: pg_sys::Datum, relid: pg_sys::Oid) {
+pub(crate) unsafe extern "C-unwind" fn on_relcache_invalidation(_arg: pg_sys::Datum, relid: pg_sys::Oid) {
     let known = REGISTRY_RELID.try_with(Cell::get).ok().flatten();
-    if relid != pg_sys::InvalidOid && Some(relid) != known {
+    let relevant = relid == pg_sys::InvalidOid || known.is_none_or(|r| r == relid);
+    if !relevant {
         return;
     }
     let _ = GENERATION.try_with(|g| g.set(g.get().wrapping_add(1)));
-    let _ = INVALIDATED_IN_XACT.try_with(|f| f.set(true));
     clear();
+    if OWN_PENDING.try_with(|o| o.replace(false)) == Ok(false) {
+        let _ = INVALIDATED_THIS_XACT.try_with(|f| f.set(true));
+    }
 }
 
-/// Transaction callback: resets the per-transaction invalidation flag at transaction end.
+/// Transaction callback: resets the per-transaction state at transaction end.
 #[pg_guard]
-unsafe extern "C-unwind" fn on_xact_end(event: pg_sys::XactEvent::Type, _arg: *mut std::ffi::c_void) {
+pub(crate) unsafe extern "C-unwind" fn on_xact_end(event: pg_sys::XactEvent::Type, _arg: *mut std::ffi::c_void) {
     use pg_sys::XactEvent::*;
     if matches!(
         event,
         XACT_EVENT_COMMIT | XACT_EVENT_ABORT | XACT_EVENT_PREPARE | XACT_EVENT_PARALLEL_COMMIT | XACT_EVENT_PARALLEL_ABORT
     ) {
-        let _ = INVALIDATED_IN_XACT.try_with(|f| f.set(false));
+        let _ = INVALIDATED_THIS_XACT.try_with(|f| f.set(false));
+        let _ = OWN_PENDING.try_with(|o| o.set(false));
     }
+}
+
+/// Test-only: forget the registry relid, the flags and every cached validator,
+/// as in a backend that has never registered or validated.
+#[cfg(any(test, feature = "pg_test"))]
+pub fn reset_for_test() {
+    clear();
+    REGISTRY_RELID.set(None);
+    INVALIDATED_THIS_XACT.set(false);
+    OWN_PENDING.set(false);
 }
