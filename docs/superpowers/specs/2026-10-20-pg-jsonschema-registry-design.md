@@ -230,11 +230,20 @@ validator that is already stale for every later transaction. Two rules
 close this:
 
 1. The relcache callback also sets a per-transaction flag "registry
-   invalidated in this transaction"; a transaction-end callback (commit,
-   abort, prepare, and the parallel variants) resets it. A validator
-   compiled while the flag is set is used for the current call but never
-   inserted into the cache. The price is recompilation for the rest of that
-   one transaction, paid only when the registry changed concurrently.
+   invalidated in this transaction", but only when the message is processed
+   inside a transaction that has already taken its first snapshot
+   (`IsTransactionState() && FirstSnapshotSet`); messages processed at
+   transaction start, or at abort, cannot belong to a change the next
+   snapshot misses, because a committing backend makes its commit visible
+   before it sends its invalidation messages. A transaction-end callback
+   resets the flag. The backend's own registrations are marked before
+   sending (`OWN_PENDING`) so they never set the flag; a subtransaction
+   abort clears the mark. A validator compiled while the flag is set is
+   used for the current call but never inserted into the cache. The price
+   is recompilation for the rest of that one transaction, paid only by a
+   transaction whose snapshot predates a change it has processed. (Final
+   rule after the whole-branch review, 2026-10-20; the earlier version
+   disabled caching for the whole transaction after every registration.)
 2. `get_or_compile` calls `AcceptInvalidationMessages()` before consulting
    the cache, so the hit path observes committed registry changes at the
    same point Postgres's own catalog caches do (every lock acquisition and
