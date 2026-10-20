@@ -101,7 +101,7 @@ INSERT INTO customers VALUES ('{"id": 2, "address": {"city": "Oslo"}}');
 
 Always give constraints an explicit version, as above, so the constraint keeps meaning the same thing when a newer version is registered.
 
-Versions are immutable. To change a schema, register a new version; to remove one, `unregister` it:
+Versions are immutable (an `UPDATE` of a registry row is refused). To change a schema, register a new version; to remove one, `unregister` it:
 
 ```sql
 SELECT jsonschema.register('customer', '{"type": "object"}');   -- 2
@@ -161,6 +161,8 @@ For `validate`, the DETAIL line is `<n> error(s): [...]` with every error as a J
   ```
 
   Run that `GRANT` outside heavy registration traffic. It takes strong locks on the registry tables, and in the worst case it can fail with a transient deadlock error against a concurrent `register`. Rerun it if that happens.
+- Use only `register` and `unregister` to change the registry. Direct DML is guarded: `UPDATE` of `jsonschema.registry` is always refused (`0A000`, rows are immutable), even for superusers. `INSERT` and `DELETE` on the registry tables are possible for roles with the grants above, and statement triggers on `registry`, `ids` and `refs` invalidate every backend's cache when they happen, but they bypass `register`'s checks (meta-schema validation, compilation, `$ref` bookkeeping, the dependency check in `unregister`).
+- `jsonschema.invalidate_cache()`, which those triggers call, requires `INSERT` or `DELETE` on `jsonschema.registry` (`42501` otherwise), so a role that cannot change the registry cannot flush every backend's cache.
 - Nothing uses `SECURITY DEFINER`, and the extension creates no roles.
 
 ## Caching and consistency

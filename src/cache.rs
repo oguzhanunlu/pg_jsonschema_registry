@@ -1,9 +1,11 @@
 //! Per-backend cache of compiled validators keyed by `(name, version)`.
 //!
 //! Invalidation: `register`/`unregister` call [`invalidate`], which queues a relcache
-//! invalidation of `jsonschema.registry`. Postgres delivers the message to every
-//! backend at commit (and to this backend at command end or abort), and
-//! [`on_relcache_invalidation`] clears the map and bumps a generation counter. [`get_or_compile`] calls `AcceptInvalidationMessages()` first, so the hit
+//! invalidation of `jsonschema.registry`; so do the statement triggers on the registry
+//! tables (through `jsonschema.invalidate_cache()`), which cover direct DML. Postgres
+//! delivers the message to every backend at commit (and to this backend at command end
+//! or abort), and [`on_relcache_invalidation`] clears the map and bumps a generation
+//! counter. [`get_or_compile`] calls `AcceptInvalidationMessages()` first, so the hit
 //! path observes committed registry changes at the same point Postgres's own catalog
 //! caches do.
 //!

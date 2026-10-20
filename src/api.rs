@@ -126,6 +126,53 @@ mod jsonschema {
         ))
     }
 
+    /// Queues an invalidation of every backend's validator cache (delivered at commit).
+    /// Called by the statement triggers on the registry tables, so direct `INSERT` /
+    /// `DELETE` also invalidate. Requires `INSERT` or `DELETE` on `jsonschema.registry`
+    /// (42501 otherwise), so that roles that cannot change the registry cannot flush
+    /// every backend's cache.
+    #[pg_extern(volatile, parallel_unsafe)]
+    fn invalidate_cache() {
+        if !registry::may_modify() {
+            fail(
+                PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+                "permission denied: invalidate_cache requires INSERT or DELETE on jsonschema.registry"
+                    .into(),
+            );
+        }
+        cache::invalidate();
+    }
+
+    extension_sql!(
+        r#"
+CREATE FUNCTION jsonschema.forbid_update() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'jsonschema.registry rows are immutable; unregister and register a new version instead'
+        USING ERRCODE = 'feature_not_supported';
+END
+$$;
+
+CREATE TRIGGER registry_immutable BEFORE UPDATE ON jsonschema.registry
+    FOR EACH ROW EXECUTE FUNCTION jsonschema.forbid_update();
+
+CREATE FUNCTION jsonschema.on_registry_change() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM jsonschema.invalidate_cache();
+    RETURN NULL;
+END
+$$;
+
+CREATE TRIGGER registry_changed AFTER INSERT OR DELETE ON jsonschema.registry
+    FOR EACH STATEMENT EXECUTE FUNCTION jsonschema.on_registry_change();
+CREATE TRIGGER ids_changed AFTER INSERT OR DELETE ON jsonschema.ids
+    FOR EACH STATEMENT EXECUTE FUNCTION jsonschema.on_registry_change();
+CREATE TRIGGER refs_changed AFTER INSERT OR DELETE ON jsonschema.refs
+    FOR EACH STATEMENT EXECUTE FUNCTION jsonschema.on_registry_change();
+"#,
+        name = "registry_triggers",
+        requires = [invalidate_cache],
+    );
+
     #[pg_extern(volatile, strict, parallel_unsafe)]
     fn unregister(name: &str, version: i32) {
         let Some(row) = registry::lookup(name, version) else {
@@ -555,6 +602,60 @@ mod tests {
         let (_, e2, i2) = stats();
         assert_eq!(e2, Some(0));
         assert!(i2 > i1, "{i2:?} > {i1:?}");
+    }
+
+    #[pg_test]
+    fn update_of_registry_row_is_rejected() {
+        reg("SELECT jsonschema.register('p', '{}')").unwrap();
+        let hit = PgTryBuilder::new(|| {
+            Spi::run("UPDATE jsonschema.registry SET schema = '{\"type\":\"array\"}'").unwrap();
+            false
+        })
+        .catch_when(PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED, |_| true)
+        .execute();
+        assert!(hit);
+    }
+
+    #[pg_test(error = "schema p version 1 is not registered")]
+    fn direct_delete_in_warm_backend_makes_valid_raise() {
+        reg("SELECT jsonschema.register('p', '{}')").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+        // No unregister(): the statement trigger must invalidate the warm cache.
+        Spi::run("DELETE FROM jsonschema.registry WHERE name = 'p'").unwrap();
+        Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)").unwrap();
+    }
+
+    #[pg_test]
+    fn direct_insert_invalidates_warm_cache() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p', 1)"),
+            Ok(Some(false))
+        );
+        Spi::run("DELETE FROM jsonschema.registry WHERE name = 'p'").unwrap();
+        Spi::run(
+            "INSERT INTO jsonschema.registry (name, version, schema, draft) \
+             VALUES ('p', 1, '{\"type\":\"array\"}', '2020-12')",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT jsonschema.valid('[]', 'p', 1)"),
+            Ok(Some(true))
+        );
+    }
+
+    #[pg_test]
+    fn invalidate_cache_requires_registry_privileges() {
+        Spi::run("CREATE ROLE pgjsr_reader").unwrap();
+        Spi::run("SET ROLE pgjsr_reader").unwrap();
+        // Last action: a caught ERROR without a subtransaction leaves the transaction undefined.
+        let denied = PgTryBuilder::new(|| {
+            Spi::run("SELECT jsonschema.invalidate_cache()").unwrap();
+            false
+        })
+        .catch_when(PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE, |_| true)
+        .execute();
+        assert!(denied);
     }
 
     #[pg_test]

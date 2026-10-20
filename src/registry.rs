@@ -170,6 +170,15 @@ pub fn lock_for_register() {
         .expect("registry lock failed");
 }
 
+/// Whether the current user holds `INSERT` or `DELETE` on `jsonschema.registry`.
+pub fn may_modify() -> bool {
+    select_one::<bool>(
+        "SELECT has_table_privilege('jsonschema.registry', 'INSERT, DELETE')",
+        &[],
+    )
+    .unwrap_or(false)
+}
+
 pub fn relid() -> pg_sys::Oid {
     select_one::<pg_sys::Oid>("SELECT 'jsonschema.registry'::regclass::oid", &[])
         .expect("registry table not found")
