@@ -1,2 +1,6 @@
-comment = 'JSON Schema Registry for PostgreSQL'
-default_version = '0.1.0'
+comment = 'JSON Schema registry: named, versioned schemas with cached jsonb validation'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_jsonschema_registry'
+relocatable = false
+superuser = true
+trusted = false
