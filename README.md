@@ -10,9 +10,11 @@ Build and install with a Rust toolchain and the matching `cargo-pgrx` (the versi
 
 ```sh
 cargo install --locked cargo-pgrx --version 0.19.3
-cargo pgrx init --pg18=$(which pg_config)     # once; use --pg15 .. --pg17 for other versions
+cargo pgrx init --pg18=/path/to/pg_config     # once; use --pg15 .. --pg17 for other versions
 cargo pgrx install --release
 ```
+
+`pg_config` must be the PostgreSQL server's, which includes the server headers, for example `/opt/homebrew/opt/postgresql@18/bin/pg_config` on macOS with Homebrew or `/usr/lib/postgresql/18/bin/pg_config` on Debian with PGDG packages. A client-only `pg_config` such as the one from Homebrew's `libpq` does not work. `cargo pgrx install` installs into the PostgreSQL that this `pg_config` belongs to.
 
 Then, in each database:
 

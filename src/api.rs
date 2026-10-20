@@ -649,6 +649,15 @@ mod tests {
     }
 
     #[pg_test]
+    fn unregister_lists_every_dependent() {
+        reg("SELECT jsonschema.register('address', '{\"type\":\"object\"}')").unwrap();
+        reg("SELECT jsonschema.register('order', '{\"$ref\":\"urn:pg-jsonschema-registry:address:1\"}')").unwrap();
+        reg("SELECT jsonschema.register('invoice', '{\"$ref\":\"urn:pg-jsonschema-registry:address:1\"}')").unwrap();
+        let msg = error_message("SELECT jsonschema.unregister('address', 1)");
+        assert!(msg.contains("invoice/1, order/1"), "{msg}");
+    }
+
+    #[pg_test]
     fn unregister_sqlstate_is_2bp01() {
         reg("SELECT jsonschema.register('address', '{}')").unwrap();
         reg("SELECT jsonschema.register('order', '{\"$ref\":\"urn:pg-jsonschema-registry:address:1\"}')").unwrap();

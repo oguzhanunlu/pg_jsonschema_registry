@@ -33,6 +33,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         run: |
+          apt-get update
           apt-get install -y --no-install-recommends curl libclang-dev
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c rustfmt -c clippy
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"

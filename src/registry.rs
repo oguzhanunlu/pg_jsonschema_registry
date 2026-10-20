@@ -132,7 +132,7 @@ pub fn insert_ref(schema_id: i64, ref_id: i64) {
 
 pub fn dependents(id: i64) -> Vec<(String, i32)> {
     Spi::connect(|client| {
-        let mut table = client.select(
+        let table = client.select(
             "SELECT r.name, r.version FROM jsonschema.refs f \
              JOIN jsonschema.registry r ON r.id = f.schema_id \
              WHERE f.ref_id = $1 ORDER BY r.name, r.version",
@@ -140,7 +140,7 @@ pub fn dependents(id: i64) -> Vec<(String, i32)> {
             &[DatumWithOid::from(id)],
         )?;
         let mut out = Vec::new();
-        if let Some(row) = table.next() {
+        for row in table {
             let name = row.get::<String>(1)?.expect("name is NOT NULL");
             let version = row.get::<i32>(2)?.expect("version is NOT NULL");
             out.push((name, version));
