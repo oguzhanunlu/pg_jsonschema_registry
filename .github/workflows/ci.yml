@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (PostgreSQL ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    container: pgxn/pgxn-tools
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17, 18]
+    steps:
+      - name: Start PostgreSQL ${{ matrix.pg }}
+        run: pg-start ${{ matrix.pg }}
+      - uses: actions/checkout@v4
+      # Installs Rust and the cargo-pgrx version pinned in Cargo.toml, then runs cargo pgrx test.
+      - name: Build and test
+        run: pgrx-build-test
+
+  lint:
+    name: fmt and clippy
+    runs-on: ubuntu-latest
+    container: pgxn/pgxn-tools
+    steps:
+      # pg-start installs the server headers and pg_config that pgrx's build script needs.
+      - name: Install PostgreSQL 18 headers
+        run: pg-start 18
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          apt-get install -y --no-install-recommends curl libclang-dev
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c rustfmt -c clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        env:
+          PGRX_PG_CONFIG_PATH: /usr/lib/postgresql/18/bin/pg_config
+        run: cargo clippy --features pg18 -- -D warnings

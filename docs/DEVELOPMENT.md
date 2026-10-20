@@ -176,6 +176,30 @@ Environment variables:
 | `PG_CONFIG` | `/opt/homebrew/opt/postgresql@18/bin/pg_config` | both scripts (install target, client binaries via `--bindir`) |
 | `PGJSR_TEST_DSN` | `host=localhost port=5432 dbname=pgjsr_it` | `integration-test.sh`, `tests/integration.rs` |
 
+## Lint
+
+CI runs these two checks; run them before pushing (both must print nothing
+but the cargo progress lines):
+
+```sh
+cargo fmt --check
+cargo clippy --features pg18 -- -D warnings
+cargo clippy --features pg18,pg_test --tests -- -D warnings   # also lints the #[pg_test] code
+```
+
+`cargo fmt` fixes formatting in place.
+
+## Benchmarks
+
+`docs/benchmarks.md` has the method, results and caveats of the comparison
+with pg_jsonschema `master`; `bench/run.sh` reproduces it in Docker.
+
+## CI
+
+`.github/workflows/ci.yml` runs `pgrx-build-test` (from the `pgxn/pgxn-tools`
+image) on PostgreSQL 15 to 18, plus the lint job above. It cannot be run
+locally.
+
 ## Version coupling to remember
 
 - The `pgrx` version in `Cargo.toml` and the installed `cargo-pgrx` must
