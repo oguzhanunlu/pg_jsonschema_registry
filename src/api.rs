@@ -483,4 +483,45 @@ mod tests {
             .execute();
         assert!(hit);
     }
+
+    #[pg_test]
+    fn non_superuser_can_validate_but_not_register() {
+        reg("SELECT jsonschema.register('p', '{\"type\":\"object\"}')").unwrap();
+        Spi::run("CREATE ROLE pgjsr_reader").unwrap();
+        Spi::run("SET ROLE pgjsr_reader").unwrap();
+        assert_eq!(Spi::get_one::<bool>("SELECT jsonschema.valid('{}', 'p', 1)"), Ok(Some(true)));
+        // Last action: a caught ERROR without a subtransaction leaves the transaction undefined.
+        let denied = PgTryBuilder::new(|| { reg("SELECT jsonschema.register('q', '{}')").unwrap(); false })
+            .catch_when(PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE, |_| true)
+            .execute();
+        assert!(denied);
+    }
+
+    #[pg_test]
+    fn non_superuser_can_register_after_grant() {
+        // Take the registry lock first (as every register does) so the GRANT below cannot
+        // deadlock against concurrent tests that lock registry before the other tables.
+        reg("SELECT jsonschema.register('warmup', '{}')").unwrap();
+        Spi::run("CREATE ROLE pgjsr_reader").unwrap();
+        Spi::run("GRANT INSERT, DELETE ON ALL TABLES IN SCHEMA jsonschema TO pgjsr_reader").unwrap();
+        Spi::run("SET ROLE pgjsr_reader").unwrap();
+        assert_eq!(reg("SELECT jsonschema.register('q', '{}')"), Ok(Some(1)));
+        Spi::run("RESET ROLE").unwrap();
+    }
+
+    #[pg_test]
+    fn every_draft_registers_and_validates() {
+        for (name, uri) in [
+            ("d4", "http://json-schema.org/draft-04/schema#"),
+            ("d6", "http://json-schema.org/draft-06/schema#"),
+            ("d7", "http://json-schema.org/draft-07/schema#"),
+            ("d2019", "https://json-schema.org/draft/2019-09/schema"),
+            ("d2020", "https://json-schema.org/draft/2020-12/schema"),
+        ] {
+            reg(&format!("SELECT jsonschema.register('{name}', '{{\"$schema\":\"{uri}\",\"type\":\"integer\",\"minimum\":1}}')")).unwrap();
+            assert_eq!(Spi::get_one::<bool>(&format!("SELECT jsonschema.valid('1', '{name}', 1)")), Ok(Some(true)));
+            assert_eq!(Spi::get_one::<bool>(&format!("SELECT jsonschema.valid('0', '{name}', 1)")), Ok(Some(false)));
+        }
+        assert_eq!(Spi::get_one::<String>("SELECT draft FROM jsonschema.registry WHERE name='d2019'"), Ok(Some("2019-09".into())));
+    }
 }
