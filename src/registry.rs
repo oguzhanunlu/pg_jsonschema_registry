@@ -6,7 +6,7 @@
 
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
-use pgrx::{JsonB, PgSqlErrorCode, PgTryBuilder};
+use pgrx::JsonB;
 
 pub struct Row {
     pub id: i64,
@@ -65,31 +65,35 @@ pub fn insert_schema(name: &str, version: i32, schema: &serde_json::Value, draft
     .expect("insert_schema returned no id")
 }
 
+/// Registers `uri` for `schema_id`. Pre-checks for an existing owner instead of
+/// catching the unique violation. The check-then-insert is race-free only when
+/// the caller holds `lock_for_register()` (SHARE ROW EXCLUSIVE), which `register`
+/// does; a caller that bypasses the lock gets the raw unique violation.
 pub fn insert_id(uri: &str, schema_id: i64) -> Result<(), String> {
-    let conflict = PgTryBuilder::new(|| {
-        Spi::run_with_args(
-            "INSERT INTO jsonschema.ids (uri, schema_id) VALUES ($1, $2)",
-            &[DatumWithOid::from(uri), DatumWithOid::from(schema_id)],
-        )
-        .expect("registry insert_id failed");
-        false
+    let owner = Spi::connect(|client| {
+        let table = client.select(
+            "SELECT r.name, r.version FROM jsonschema.ids i \
+             JOIN jsonschema.registry r ON r.id = i.schema_id WHERE i.uri = $1",
+            Some(1),
+            &[DatumWithOid::from(uri)],
+        )?;
+        for row in table {
+            let name = row.get::<String>(1)?.expect("name is NOT NULL");
+            let version = row.get::<i32>(2)?.expect("version is NOT NULL");
+            return Ok::<_, pgrx::spi::Error>(Some((name, version)));
+        }
+        Ok(None)
     })
-    .catch_when(PgSqlErrorCode::ERRCODE_UNIQUE_VIOLATION, |_| true)
-    .execute();
-    if !conflict {
-        return Ok(());
-    }
-    let owner = Spi::get_two_with_args::<String, i32>(
-        "SELECT r.name, r.version FROM jsonschema.ids i \
-         JOIN jsonschema.registry r ON r.id = i.schema_id WHERE i.uri = $1",
-        &[DatumWithOid::from(uri)],
-    )
     .expect("registry owner lookup failed");
-    let owner = match owner {
-        (Some(n), Some(v)) => format!("{n}/{v}"),
-        _ => "another schema".to_string(),
-    };
-    Err(format!("$id {uri} is already registered by {owner}"))
+    if let Some((name, version)) = owner {
+        return Err(format!("$id {uri} is already registered by {name}/{version}"));
+    }
+    Spi::run_with_args(
+        "INSERT INTO jsonschema.ids (uri, schema_id) VALUES ($1, $2)",
+        &[DatumWithOid::from(uri), DatumWithOid::from(schema_id)],
+    )
+    .expect("registry insert_id failed");
+    Ok(())
 }
 
 pub fn insert_ref(schema_id: i64, ref_id: i64) {
