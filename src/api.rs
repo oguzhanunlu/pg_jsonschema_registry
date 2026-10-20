@@ -59,6 +59,9 @@ mod jsonschema {
         JsonB(serde_json::Value::Array(crate::errors::collect(&v, &doc)))
     }
 
+    /// Errors listed in `validate`'s DETAIL; `errors()` returns all of them.
+    const DETAIL_MAX_ERRORS: usize = 20;
+
     #[pg_extern(stable, strict, parallel_safe)]
     fn validate(doc: RawJsonb, name: &str, version: i32) -> bool {
         check_depth(&doc);
@@ -69,19 +72,18 @@ mod jsonschema {
         let errs = crate::errors::collect(&v, &doc);
         let first = errs.first();
         let field = |k: &str| first.and_then(|e| e[k].as_str()).unwrap_or("").to_string();
-        fail_with_detail(
-            PgSqlErrorCode::ERRCODE_CHECK_VIOLATION,
-            format!(
-                "document does not match schema {name} version {version}: {} at {}",
-                field("message"),
-                field("instance_path")
-            ),
-            format!(
-                "{} error(s): {}",
-                errs.len(),
-                serde_json::Value::Array(errs)
-            ),
-        )
+        let message = format!(
+            "document does not match schema {name} version {version}: {} at {}",
+            field("message"),
+            field("instance_path")
+        );
+        let total = errs.len();
+        let shown: Vec<serde_json::Value> = errs.into_iter().take(DETAIL_MAX_ERRORS).collect();
+        let mut detail = format!("{total} error(s): {}", serde_json::Value::Array(shown));
+        if total > DETAIL_MAX_ERRORS {
+            detail.push_str(&format!(" \u{2026} and {} more", total - DETAIL_MAX_ERRORS));
+        }
+        fail_with_detail(PgSqlErrorCode::ERRCODE_CHECK_VIOLATION, message, detail)
     }
 
     #[pg_extern(stable, strict, parallel_safe, name = "valid")]
@@ -187,8 +189,14 @@ CREATE TRIGGER refs_changed AFTER INSERT OR DELETE ON jsonschema.refs
         requires = [invalidate_cache],
     );
 
+    /// Deletes one version, refusing while another registered schema references it.
+    /// Takes the same `SHARE ROW EXCLUSIVE` lock on `jsonschema.registry` as `register`,
+    /// so concurrent `register` / `unregister` calls serialize (the dependency check
+    /// cannot miss a reference added concurrently), and therefore needs the same
+    /// privileges as `register`.
     #[pg_extern(volatile, strict, parallel_unsafe)]
     fn unregister(name: &str, version: i32) {
+        registry::lock_for_register();
         let Some(row) = registry::lookup(name, version) else {
             fail(
                 PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
@@ -206,7 +214,13 @@ CREATE TRIGGER refs_changed AFTER INSERT OR DELETE ON jsonschema.refs
                 ),
             );
         }
-        registry::delete(name, version);
+        if registry::delete(name, version).is_none() {
+            // Removed concurrently (e.g. by a direct DELETE) after the lookup.
+            fail(
+                PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
+                format!("schema {name} version {version} is not registered"),
+            );
+        }
         cache::invalidate();
     }
 
@@ -236,6 +250,13 @@ CREATE TRIGGER refs_changed AFTER INSERT OR DELETE ON jsonschema.refs
             Ok(id) => id,
             Err(msg) => fail(BAD, msg),
         };
+        if ::jsonschema::Draft::default().detect(&schema) == ::jsonschema::Draft::Unknown {
+            let uri = schema.get("$schema").and_then(|v| v.as_str()).unwrap_or("");
+            fail(
+                BAD,
+                format!("unsupported $schema: {uri} (custom meta-schemas are not supported)"),
+            );
+        }
         if let Err(e) = ::jsonschema::meta::validate(&schema) {
             fail(BAD, format!("invalid JSON Schema: {e}"));
         }
@@ -908,6 +929,55 @@ mod tests {
             caught.1.contains("\"keyword\":\"required\"") || caught.1.contains("required"),
             "{}",
             caught.1
+        );
+    }
+
+    #[pg_test]
+    fn validate_detail_lists_at_most_20_errors() {
+        // 25 required properties missing: 25 errors.
+        let req: Vec<String> = (0..25).map(|i| format!("\"p{i}\"")).collect();
+        reg(&format!(
+            "SELECT jsonschema.register('many', '{{\"required\":[{}]}}')",
+            req.join(",")
+        ))
+        .unwrap();
+        let errs = Spi::get_one::<pgrx::JsonB>("SELECT jsonschema.errors('{}', 'many', 1)")
+            .unwrap()
+            .unwrap();
+        let total = errs.0.as_array().unwrap().len();
+        assert!(total > 20, "{total}");
+        let detail = PgTryBuilder::new(|| {
+            Spi::get_one::<bool>("SELECT jsonschema.validate('{}', 'many', 1)").unwrap();
+            None
+        })
+        .catch_when(PgSqlErrorCode::ERRCODE_CHECK_VIOLATION, |e| match e {
+            CaughtError::ErrorReport(r) | CaughtError::PostgresError(r) => {
+                Some(r.detail().unwrap_or("").to_string())
+            }
+            _ => None,
+        })
+        .execute()
+        .expect("expected ERRCODE_CHECK_VIOLATION");
+        let suffix = format!(" \u{2026} and {} more", total - 20);
+        assert!(
+            detail.starts_with(&format!("{total} error(s): [")),
+            "{detail}"
+        );
+        assert!(detail.ends_with(&suffix), "{detail}");
+        let list = &detail[detail.find('[').unwrap()..detail.len() - suffix.len()];
+        let shown: serde_json::Value = serde_json::from_str(list).unwrap();
+        assert_eq!(shown.as_array().unwrap().len(), 20);
+    }
+
+    #[pg_test]
+    fn unknown_meta_schema_is_rejected_with_clear_message() {
+        let (code, msg) = error_code(
+            "SELECT jsonschema.register('c', '{\"$schema\":\"https://example.com/my-meta\"}')",
+        );
+        assert_eq!(code, PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE);
+        assert_eq!(
+            msg,
+            "unsupported $schema: https://example.com/my-meta (custom meta-schemas are not supported)"
         );
     }
 

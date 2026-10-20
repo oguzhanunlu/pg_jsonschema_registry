@@ -73,7 +73,7 @@ pgbench runs `-n -c 1 -T 30 -r` (one client, simple query protocol) with
 per-call cost, not throughput under concurrency. The value is pgbench's
 per-statement average latency for one full-table query.
 
-Caveats: one run per row (no repeated-run variance). Run order is fixed:
+Caveats: one run per row (no repeated-run variance). An earlier full run differed by about 20% on the small scenario (registry / master 1.39× there versus 1.71× below), and run-to-run variance was not measured, so treat the ratios as rough. Run order is fixed:
 theirs before ours in every pgbench pair, and plain, theirs, ours within each
 insert round. No separate warm-up: each pgbench connection's first
 transaction compiles the schema (theirs and ours alike) inside the 30 s

@@ -1,24 +1,25 @@
 # Development environment
 
-How the local build/test environment for `pg_jsonschema_registry` is set up
-and how to use it on your own. The extension is written in Rust with
+How to set up a local build and test environment for `pg_jsonschema_registry`
+on macOS with Homebrew, and how to use it. The extension is written in Rust with
 [pgrx](https://github.com/pgcentralfoundation/pgrx), and validation is done
 by the [`jsonschema`](https://docs.rs/jsonschema) crate.
 
-Everything below was set up on macOS (Apple Silicon) on 2026-10-19/20. Linux
-builds happen in Docker (see the end of this document).
+The paths below are those of Homebrew on Apple Silicon (`/opt/homebrew`); on
+Intel Macs Homebrew uses `/usr/local` instead. Linux builds happen in Docker
+(see the end of this document).
 
-## What is installed
+## What to install
 
 | Component | How | Notes |
 |---|---|---|
-| PostgreSQL 18.6 server + headers | `brew install postgresql@18` | keg-only, so it does not shadow `libpq` unless on PATH |
-| Rust stable (1.99.1) | `rustup` (minimal profile + clippy, rustfmt) | lives in `~/.cargo`, `~/.rustup`; `. ~/.cargo/env` in `~/.zshrc` |
+| PostgreSQL 18 server + headers | `brew install postgresql@18` | keg-only, so it does not shadow `libpq` unless on PATH |
+| Rust stable | `rustup` (minimal profile + clippy, rustfmt) | lives in `~/.cargo`, `~/.rustup`; add `. "$HOME/.cargo/env"` to your shell profile |
 | cargo-pgrx 0.19.3 | `cargo install --locked cargo-pgrx` | the pgrx command-line tool; its version must match the `pgrx` crate version in `Cargo.toml` |
 | pgrx home | `cargo pgrx init --pg18=/opt/homebrew/opt/postgresql@18/bin/pg_config` | `~/.pgrx/config.toml` + a separate data dir for the test instance |
-| Apple clang 21, GNU make, libclang | Xcode Command Line Tools | already present; pgrx's bindgen needs libclang |
-| libpq 18.4 (client only) | `brew install libpq` | was already present |
-| Docker Desktop | already present | Linux builds, benchmarking against pg_jsonschema |
+| Apple clang, GNU make, libclang | Xcode Command Line Tools (`xcode-select --install`) | pgrx's bindgen needs libclang |
+| libpq (client only) | `brew install libpq` | optional; see the PATH note below |
+| Docker Desktop | from docker.com | optional; Linux builds, benchmarking against pg_jsonschema |
 
 Paths that matter:
 
@@ -32,15 +33,15 @@ pgrx config             ~/.pgrx/config.toml
 pgrx test data dir      ~/.pgrx/data-18                          (port 28818, managed by cargo pgrx)
 ```
 
-All of these are owned by your user, so installing the extension needs no
-`sudo`.
+With Homebrew these are owned by your user, so installing the extension
+needs no `sudo`.
 
 ## PATH: the one gotcha
 
-`libpq` was already on your PATH (`/opt/homebrew/opt/libpq/bin`) with its own
-`pg_config`. That `pg_config` has no server headers, so pgrx cannot build
-against it. Two lines were appended to `~/.zshrc` (backup of the original at
-`~/.zshrc.bak-pre-pg18`):
+If Homebrew's `libpq` is on your PATH (`/opt/homebrew/opt/libpq/bin`), its
+`pg_config` comes first. That `pg_config` has no server headers, so pgrx
+cannot build against it. Put the server's binaries first, for example in
+`~/.zshrc`:
 
 ```sh
 export PATH="/opt/homebrew/opt/postgresql@18/bin:$PATH"
@@ -51,7 +52,7 @@ Open a new terminal (or `source ~/.zshrc`) and check:
 
 ```sh
 which pg_config        # -> /opt/homebrew/opt/postgresql@18/bin/pg_config
-pg_config --version    # -> PostgreSQL 18.6 (Homebrew)
+pg_config --version    # -> PostgreSQL 18.x (Homebrew)
 cargo pgrx --version   # -> cargo-pgrx 0.19.3
 ```
 
@@ -85,7 +86,7 @@ psql -d postgres -c 'select version()'
 ```
 
 Connection defaults: Unix socket in `/tmp`, port 5432, database `postgres`,
-superuser is your macOS user, no password.
+superuser is the macOS user that ran `brew install`, no password.
 
 To wipe it and start over:
 
@@ -212,15 +213,19 @@ locally.
 
 ## Toolchain smoke test
 
-What was run to prove the Rust path works end to end: `cargo pgrx new
-hello_pgrx` in a scratch directory, then `cargo pgrx test pg18`, which
-compiled the template extension, installed it into the managed instance,
-started that instance, and ran the template's `#[pg_test]`. If you ever doubt
-the toolchain, repeat exactly that in a scratch directory.
+To check the toolchain end to end, run `cargo pgrx new hello_pgrx` in a
+scratch directory, then `cargo pgrx test pg18` there. It compiles the template
+extension, installs it into the managed instance, starts that instance, and
+runs the template's `#[pg_test]`.
 
-(Before the switch to Rust, a throwaway C extension was also compiled with
-PGXS and run against the Homebrew service, so the C toolchain and the server
-headers are known good too.)
+## Inspecting the cache
+
+`SELECT * FROM jsonschema.cache_stats();` shows the calling backend's cache
+counters: `compiles` (schema compilations so far), `entries` (validators cached
+now) and `invalidations` (times a registry invalidation cleared the cache). The
+numbers are per backend, so run it in the session you are looking at. The
+integration tests use `compiles` to check that a transaction compiles a schema
+once and then hits the cache.
 
 ## Linux builds and benchmarking (Docker)
 
@@ -237,5 +242,5 @@ image has a `pgrx-build-test` helper that does most of this.
 brew services stop postgresql@18 && brew uninstall postgresql@18
 rustup self uninstall                       # removes ~/.cargo and ~/.rustup, including cargo-pgrx
 rm -rf ~/.pgrx
-# then delete the two lines added to ~/.zshrc (or restore ~/.zshrc.bak-pre-pg18)
+# then remove the PATH and cargo lines from your shell profile
 ```

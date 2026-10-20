@@ -131,7 +131,7 @@ All functions are in schema `jsonschema`, and every function that takes argument
 | `latest_version(name)` | `int` | stable, parallel safe | Highest registered version of `name`. |
 | `cache_stats()` | `table(compiles bigint, entries int, invalidations bigint)` | stable, parallel safe | Cache counters of the calling backend; see [Caching and consistency](#caching-and-consistency). |
 
-Tables and view (all in schema `jsonschema`, readable by everyone): `registry` (one row per name and version, with the schema, detected draft, creator and creation time), `ids` (the normalized top-level `$id` of each schema that has one), `refs` (which schema references which), and the view `schemas` that joins them.
+Tables and view (all in schema `jsonschema`, readable by everyone): `registry` (one row per name and version, with the schema, detected draft, `created_by` and `created_at`; `created_by` is the role that inserted the row, informational only and not an audit trail, since a role with `INSERT` on the table can write any value), `ids` (the normalized top-level `$id` of each schema that has one), `refs` (which schema references which), and the view `schemas` that joins them.
 
 Errors and SQLSTATEs:
 
@@ -140,6 +140,7 @@ Errors and SQLSTATEs:
 | `register`: empty name | `22023` | `name must not be empty` |
 | `register`: version not positive | `22023` | `version must be positive` |
 | `register`: version not above the current maximum | `22023` | `version must be greater than <max>` |
+| `register`: `$schema` names a meta-schema other than the five supported drafts | `22023` | `unsupported $schema: <uri> (custom meta-schemas are not supported)` |
 | `register`: schema is not a valid JSON Schema | `22023` | `invalid JSON Schema: ...` |
 | `register`: schema does not compile (for example a `$ref` that is not registered) | `22023` | `cannot compile schema: ...` |
 | `register`: top-level `$id` is relative | `22023` | `top-level $id must be an absolute URI` |
@@ -153,7 +154,7 @@ Errors and SQLSTATEs:
 | `register`: schema nested deeper than 100 levels | `54001` | `schema nesting exceeds 100 levels` |
 | `validate`: document does not match | `23514` | `document does not match schema <name> version <v>: <first error> at <instance path>` |
 
-For `validate`, the DETAIL line is `<n> error(s): [...]` with every error as a JSON array. For a large document with many errors it can be large.
+For `validate`, the DETAIL line is `<n> error(s): [...]` with the first 20 errors as a JSON array, followed by `… and <n - 20> more` when there are more. `errors()` always returns every error.
 
 ## Privileges
 
@@ -163,6 +164,8 @@ For `validate`, the DETAIL line is `<n> error(s): [...]` with every error as a J
   ```sql
   GRANT INSERT, DELETE ON ALL TABLES IN SCHEMA jsonschema TO schema_admins;
   ```
+
+  `unregister` takes the same `SHARE ROW EXCLUSIVE` lock on `jsonschema.registry` as `register` (so concurrent registrations and removals serialize and the dependency check cannot miss a concurrently added reference), and needs the same privileges.
 
   Run that `GRANT` outside heavy registration traffic. It takes strong locks on the registry tables, and in the worst case it can fail with a transient deadlock error against a concurrent `register`. Rerun it if that happens.
 - Use only `register` and `unregister` to change the registry. Direct DML is guarded: `UPDATE` of `jsonschema.registry` is always refused (`0A000`, rows are immutable), even for superusers. `INSERT` and `DELETE` on the registry tables are possible for roles with the grants above, and statement triggers on `registry`, `ids` and `refs` invalidate every backend's cache when they happen, but they bypass `register`'s checks (meta-schema validation, compilation, `$ref` bookkeeping, the dependency check in `unregister`).
@@ -224,7 +227,7 @@ Compiled from each project's README as of 2026-10; check them for current detail
 
 | | Stored schemas | Versioning | Cross-schema `$ref` by `$id` | Error output | Drafts | Language |
 |---|---|---|---|---|---|---|
-| pg_jsonschema_registry | yes, in a table | yes, per name | yes, plus `urn:pg-jsonschema-registry:<name>:<version>` | `errors()` returns every error with paths; `validate()` raises with all errors in DETAIL | 4, 6, 7, 2019-09, 2020-12 | Rust |
+| pg_jsonschema_registry | yes, in a table | yes, per name | yes, plus `urn:pg-jsonschema-registry:<name>:<version>` | `errors()` returns every error with paths; `validate()` raises with up to 20 errors in DETAIL | 4, 6, 7, 2019-09, 2020-12 | Rust |
 | [pg_jsonschema](https://github.com/supabase/pg_jsonschema) (Supabase) | no; schemas are passed as arguments (`master` adds a compiled `jsonschema` type, cached per callsite, not in a release as of 2026-10) | no | not documented | `*_matches_schema` return a boolean; `jsonschema_validation_errors` returns `text[]` of messages | whatever the `jsonschema` crate supports (README does not list them) | Rust |
 | [jsonschema](https://github.com/theory/pg-jsonschema-boon) (PGXN, theory) | no; schemas are passed on every call | no | yes, within one call (variadic schemas, matched by `$id`) | boolean | 4, 6, 7, 2019-09, 2020-12 (excluding optional features) | Rust (boon) |
 | [is_jsonb_valid](https://github.com/furstenheim/is_jsonb_valid) | no | no | `$ref` limited to references nested at root; no remote refs | boolean | 4 and 7; `format` not supported | C |
@@ -238,8 +241,8 @@ Compiled from each project's README as of 2026-10; check them for current detail
 - `unregister` checks references from other registered schemas, not from `CHECK` constraints. If a table constraint calls `validate(doc, 'name', 1)` and you unregister that version, the constraint starts raising `schema ... is not registered`.
 - The overloads without a version (`valid(doc, name)`, `errors(doc, name)`, `validate(doc, name)`) look up the latest version in the table on every call. They are not meant for constraints; use them for ad hoc queries.
 - `register` and `unregister` are not parallel safe, by design. The validation functions are.
-- `validate` puts every error in the DETAIL line, which can be large for big documents with many violations.
-- Documents nested deeper than 4096 levels are refused by `valid`, `errors` and `validate` with SQLSTATE `54001` (`document nesting exceeds 4096 levels`), and schemas nested deeper than 100 levels are refused by `register` (`54001`, `schema nesting exceeds 100 levels`). The validator recurses per nesting level without a limit of its own, so the document cap keeps a deeply nested document (which PostgreSQL can build, for example with `jsonb_build_array` in a loop) from overflowing the backend's stack. The cap counts document levels, not stack frames: a schema that recurses through several keywords per level (`allOf` inside `anyOf` inside `$ref`, and so on) uses more stack per level.
+- `validate` lists at most 20 errors in the DETAIL line; use `errors()` for the complete list.
+- Documents nested deeper than 4096 levels are refused by `valid`, `errors` and `validate` with SQLSTATE `54001` (`document nesting exceeds 4096 levels`), and schemas nested deeper than 100 levels are refused by `register` (`54001`, `schema nesting exceeds 100 levels`). The validator recurses per nesting level without a limit of its own, so the document cap keeps a deeply nested document (PostgreSQL itself accepts nesting up to what `max_stack_depth` allows, about 18 000 levels for `jsonb_in` at the default setting, and more if a DBA raises it) from overflowing the backend's stack. The cap counts document levels, not stack frames: a schema that recurses through several keywords per level (`allOf` inside `anyOf` inside `$ref`, and so on) uses more stack per level.
 - The cache is per backend and rebuilt on first use, so the first call in each new connection pays the compile cost (about 33 ms for the FHIR R4 schema in the benchmark's spot check).
 
 ## Development
