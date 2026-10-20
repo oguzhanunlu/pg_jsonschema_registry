@@ -1,0 +1,6 @@
+target/
+.superpowers/
+.git/
+.idea/
+*.iml
+tests/pg_regress/results
